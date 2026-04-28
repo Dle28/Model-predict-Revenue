@@ -5,9 +5,197 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
-from .allocation import allocate_and_reconcile, allocation_columns, daily_seasonal_shim, historical_weight_tables
-from .common import EPS, add_calendar_columns
-from .models import forecast_cogs_from_revenue, forecast_weekly_recursive
+from .common import EPS, FINAL_TRAIN_END_WEEK_ID, FINAL_TRAIN_START_WEEK_ID, add_calendar_columns, safe_div
+from .direct import blend_direct_daily_forecast
+from .lv1 import forecast_weekly_base_recursive, historical_weekly_base
+from .lv2 import allocate_base_daily_dynamic, daily_seasonal_shim, fit_allocation_model, lv2_columns
+from .lv3 import apply_spike_multiplier, fit_spike_multiplier_model
+
+
+WEEKLY_RECONCILIATION_ANCHOR_WEIGHT = 0.05
+
+
+def _train_end_date(weekly: pd.DataFrame, train_end_week_id: str, daily: pd.DataFrame) -> pd.Timestamp:
+    week_start = weekly.loc[weekly["week_id"].eq(train_end_week_id), "week_start"].max()
+    if pd.notna(week_start):
+        return pd.Timestamp(week_start) + pd.Timedelta(days=6)
+    return pd.Timestamp(daily.loc[daily["revenue"].notna(), "date"].max())
+
+
+def _train_start_date(weekly: pd.DataFrame, train_start_week_id: str | None, daily: pd.DataFrame) -> pd.Timestamp | None:
+    if train_start_week_id is None:
+        return None
+    week_start = weekly.loc[weekly["week_id"].eq(train_start_week_id), "week_start"].min()
+    if pd.notna(week_start):
+        return pd.Timestamp(week_start)
+    return pd.Timestamp(daily.loc[daily["revenue"].notna(), "date"].min())
+
+
+def reconcile_daily_to_weekly_anchor(
+    daily_pred: pd.DataFrame,
+    weekly_base: pd.DataFrame,
+    anchor_weight: float = WEEKLY_RECONCILIATION_ANCHOR_WEIGHT,
+) -> pd.DataFrame:
+    out = daily_pred.copy()
+    blend = float(np.clip(anchor_weight, 0.0, 1.0))
+    if blend <= 0.0 or out.empty:
+        return out
+
+    weekly_sums = out.groupby("week_id", as_index=False).agg(
+        Revenue_bottom_up=("Revenue", "sum"),
+        COGS_bottom_up=("COGS", "sum"),
+    )
+    anchors = weekly_sums.merge(
+        weekly_base[["week_id", "revenue_w_base", "cogs_w_base"]],
+        on="week_id",
+        how="left",
+    )
+    anchors["Revenue_anchor"] = (
+        (1.0 - blend) * anchors["Revenue_bottom_up"]
+        + blend * anchors["revenue_w_base"].fillna(anchors["Revenue_bottom_up"])
+    )
+    anchors["COGS_anchor"] = (
+        (1.0 - blend) * anchors["COGS_bottom_up"]
+        + blend * anchors["cogs_w_base"].fillna(anchors["COGS_bottom_up"])
+    )
+    anchors["Revenue_scale"] = safe_div(anchors["Revenue_anchor"], anchors["Revenue_bottom_up"]).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).fillna(1.0).clip(lower=0.50, upper=1.50)
+    anchors["COGS_scale"] = safe_div(anchors["COGS_anchor"], anchors["COGS_bottom_up"]).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).fillna(1.0).clip(lower=0.50, upper=1.50)
+    out = out.merge(anchors[["week_id", "Revenue_scale", "COGS_scale"]], on="week_id", how="left")
+    for prefix, scale_col in [("Revenue", "Revenue_scale"), ("COGS", "COGS_scale")]:
+        scale = out[scale_col].fillna(1.0).to_numpy()
+        for col in [prefix, f"{prefix}_p10", f"{prefix}_p90", f"{prefix}_p05", f"{prefix}_p95"]:
+            if col in out.columns:
+                out[col] = out[col].astype(float).to_numpy() * scale
+    return out.drop(columns=["Revenue_scale", "COGS_scale"])
+
+
+def forecast_daily_base_spikes(
+    daily: pd.DataFrame,
+    weekly: pd.DataFrame,
+    forecast_daily: pd.DataFrame,
+    train_end_week_id: str,
+    train_start_week_id: str | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    forecast_week_ids = forecast_daily["week_id"].drop_duplicates().tolist()
+    train_end_date = _train_end_date(weekly, train_end_week_id, daily)
+    train_start_date = _train_start_date(weekly, train_start_week_id, daily)
+
+    rev_weekly_base = forecast_weekly_base_recursive(weekly, "revenue_w", train_end_week_id, forecast_week_ids, train_start_week_id)
+    cogs_weekly_base = forecast_weekly_base_recursive(weekly, "cogs_w", train_end_week_id, forecast_week_ids, train_start_week_id)
+    weekly_base = rev_weekly_base.merge(cogs_weekly_base, on=["week_id", "week_start"], how="inner")
+
+    rev_hist_weekly_base = historical_weekly_base(weekly, "revenue_w", train_end_week_id, train_start_week_id)
+    cogs_hist_weekly_base = historical_weekly_base(weekly, "cogs_w", train_end_week_id, train_start_week_id)
+    rev_allocation_model = fit_allocation_model(
+        daily,
+        "revenue",
+        rev_hist_weekly_base,
+        "revenue_w_base",
+        train_end_date,
+        train_start_date,
+    )
+    cogs_allocation_model = fit_allocation_model(
+        daily,
+        "cogs",
+        cogs_hist_weekly_base,
+        "cogs_w_base",
+        train_end_date,
+        train_start_date,
+    )
+    train_daily = daily[daily["date"].le(train_end_date)].copy()
+    if train_start_date is not None:
+        train_daily = train_daily[train_daily["date"].ge(train_start_date)].copy()
+    rev_train_daily = train_daily[train_daily["week_id"].isin(rev_hist_weekly_base["week_id"])].copy()
+    cogs_train_daily = train_daily[train_daily["week_id"].isin(cogs_hist_weekly_base["week_id"])].copy()
+
+    rev_train_base = allocate_base_daily_dynamic(
+        rev_train_daily[lv2_columns(rev_train_daily)],
+        rev_hist_weekly_base,
+        "revenue_w_base",
+        "revenue_lv2_base",
+        rev_allocation_model,
+    )
+    cogs_train_base = allocate_base_daily_dynamic(
+        cogs_train_daily[lv2_columns(cogs_train_daily)],
+        cogs_hist_weekly_base,
+        "cogs_w_base",
+        "cogs_lv2_base",
+        cogs_allocation_model,
+    )
+
+    rev_spike_model = fit_spike_multiplier_model(
+        daily,
+        "revenue",
+        rev_train_base,
+        "revenue_lv2_base",
+        train_end_date,
+        train_start_date,
+    )
+    cogs_spike_model = fit_spike_multiplier_model(
+        daily,
+        "cogs",
+        cogs_train_base,
+        "cogs_lv2_base",
+        train_end_date,
+        train_start_date,
+    )
+
+    forecast_lv2 = forecast_daily[lv2_columns(forecast_daily)].copy()
+    rev_future_base = allocate_base_daily_dynamic(
+        forecast_lv2,
+        weekly_base,
+        "revenue_w_base",
+        "revenue_lv2_base",
+        rev_allocation_model,
+    )
+    cogs_future_base = allocate_base_daily_dynamic(
+        forecast_lv2,
+        weekly_base,
+        "cogs_w_base",
+        "cogs_lv2_base",
+        cogs_allocation_model,
+    )
+
+    rev_daily = apply_spike_multiplier(
+        forecast_daily,
+        rev_future_base,
+        "revenue_lv2_base",
+        "Revenue",
+        rev_spike_model,
+    )
+    cogs_daily = apply_spike_multiplier(
+        forecast_daily,
+        cogs_future_base,
+        "cogs_lv2_base",
+        "COGS",
+        cogs_spike_model,
+    )
+    daily_pred = rev_daily.merge(
+        cogs_daily.drop(columns=["week_start"]),
+        on=["date", "week_id"],
+        how="inner",
+    )
+    daily_pred = blend_direct_daily_forecast(daily, daily_pred, train_start_date, train_end_date)
+    daily_pred = reconcile_daily_to_weekly_anchor(daily_pred, weekly_base)
+
+    weekly_bottom_up = daily_pred.groupby("week_id", as_index=False).agg(
+        revenue_w_pred=("Revenue", "sum"),
+        cogs_w_pred=("COGS", "sum"),
+        revenue_w_lv2_base=("Revenue_lv2_base", "sum"),
+        cogs_w_lv2_base=("COGS_lv2_base", "sum"),
+        revenue_lv3_multiplier_avg=("Revenue_lv3_multiplier", "mean"),
+        cogs_lv3_multiplier_avg=("COGS_lv3_multiplier", "mean"),
+    )
+    weekly_pred = weekly_base.merge(weekly_bottom_up, on="week_id", how="left")
+    weekly_pred["revenue_w_pred"] = weekly_pred["revenue_w_pred"].fillna(0.0)
+    weekly_pred["cogs_w_pred"] = weekly_pred["cogs_w_pred"].fillna(0.0)
+    return daily_pred, weekly_pred
 
 
 def final_forecast(daily: pd.DataFrame, weekly: pd.DataFrame, sample: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -23,43 +211,19 @@ def final_forecast(daily: pd.DataFrame, weekly: pd.DataFrame, sample: pd.DataFra
     complete_week_ids = submission.loc[counts.eq(7), "week_id"].drop_duplicates().tolist()
     future_daily_features = daily[daily["date"].isin(sample_dates["date"])].copy()
     complete_future_daily = future_daily_features[future_daily_features["week_id"].isin(complete_week_ids)].copy()
-    forecast_week_ids = complete_future_daily["week_id"].drop_duplicates().tolist()
 
-    pred_rev = forecast_weekly_recursive(weekly, "revenue_w", "2022-W52", forecast_week_ids)
-    pred_cogs = forecast_cogs_from_revenue(weekly, pred_rev, "2022-W52", forecast_week_ids)
-    weekly_pred = pred_rev.merge(pred_cogs, on=["week_id", "week_start"], how="inner")
-
-    train_end_date = pd.Timestamp("2022-12-31")
-    rev_month_weekday, rev_weekday, rev_adjustments = historical_weight_tables(daily, "revenue", train_end_date)
-    cogs_month_weekday, cogs_weekday, cogs_adjustments = historical_weight_tables(daily, "cogs", train_end_date)
-
-    topdown_rev = allocate_and_reconcile(
-        complete_future_daily[allocation_columns(complete_future_daily)],
-        weekly_pred.rename(columns={"revenue_w_pred": "pred"}),
-        "pred",
-        "Revenue",
-        rev_month_weekday,
-        rev_weekday,
-        rev_adjustments,
+    daily_pred, weekly_pred = forecast_daily_base_spikes(
+        daily,
+        weekly,
+        complete_future_daily,
+        FINAL_TRAIN_END_WEEK_ID,
+        FINAL_TRAIN_START_WEEK_ID,
     )
-    topdown_cogs = allocate_and_reconcile(
-        complete_future_daily[allocation_columns(complete_future_daily)],
-        weekly_pred.rename(columns={"cogs_w_pred": "pred"}),
-        "pred",
-        "COGS",
-        cogs_month_weekday,
-        cogs_weekday,
-        cogs_adjustments,
-    )
-    topdown = topdown_rev[["date", "Revenue"]].merge(topdown_cogs[["date", "COGS"]], on="date")
 
-    submission = submission.drop(columns=["Revenue", "COGS"]).merge(
-        submission[["date", "Revenue", "COGS"]], on="date", how="left"
-    )
     submission = submission.set_index("date")
-    topdown = topdown.set_index("date")
-    submission.loc[topdown.index, "Revenue"] = topdown["Revenue"]
-    submission.loc[topdown.index, "COGS"] = topdown["COGS"]
+    daily_pred_idx = daily_pred.set_index("date")
+    submission.loc[daily_pred_idx.index, "Revenue"] = daily_pred_idx["Revenue"]
+    submission.loc[daily_pred_idx.index, "COGS"] = daily_pred_idx["COGS"]
     submission = submission.reset_index()
 
     interval = submission[["date", "Revenue", "COGS"]].copy()
@@ -72,31 +236,23 @@ def final_forecast(daily: pd.DataFrame, weekly: pd.DataFrame, sample: pd.DataFra
     interval["COGS_p05"] = interval["COGS"] * 0.78
     interval["COGS_p95"] = interval["COGS"] * 1.25
 
-    interval_specs = [
-        ("revenue_w_pred_p10", "Revenue_p10", rev_month_weekday, rev_weekday, rev_adjustments),
-        ("revenue_w_pred_p90", "Revenue_p90", rev_month_weekday, rev_weekday, rev_adjustments),
-        ("revenue_w_pred_p05", "Revenue_p05", rev_month_weekday, rev_weekday, rev_adjustments),
-        ("revenue_w_pred_p95", "Revenue_p95", rev_month_weekday, rev_weekday, rev_adjustments),
-        ("cogs_w_pred_p10", "COGS_p10", cogs_month_weekday, cogs_weekday, cogs_adjustments),
-        ("cogs_w_pred_p90", "COGS_p90", cogs_month_weekday, cogs_weekday, cogs_adjustments),
-        ("cogs_w_pred_p05", "COGS_p05", cogs_month_weekday, cogs_weekday, cogs_adjustments),
-        ("cogs_w_pred_p95", "COGS_p95", cogs_month_weekday, cogs_weekday, cogs_adjustments),
+    lv3_interval_cols = [
+        "Revenue_p10",
+        "Revenue_p90",
+        "Revenue_p05",
+        "Revenue_p95",
+        "COGS_p10",
+        "COGS_p90",
+        "COGS_p05",
+        "COGS_p95",
     ]
     interval = interval.set_index("date")
-    for pred_col, out_col, month_weekday, weekday, adjustments in interval_specs:
-        if pred_col not in weekly_pred.columns:
-            continue
-        allocated = allocate_and_reconcile(
-            complete_future_daily[allocation_columns(complete_future_daily)],
-            weekly_pred.rename(columns={pred_col: "pred"}),
-            "pred",
-            out_col,
-            month_weekday,
-            weekday,
-            adjustments,
-        ).set_index("date")
-        interval.loc[allocated.index, out_col] = allocated[out_col]
+    daily_pred_idx = daily_pred.set_index("date")
+    for col in lv3_interval_cols:
+        if col in daily_pred_idx.columns:
+            interval.loc[daily_pred_idx.index, col] = daily_pred_idx[col]
     interval = interval.reset_index()
+
     interval["Revenue_p10"] = np.minimum(interval["Revenue_p10"], interval["Revenue"])
     interval["Revenue_p90"] = np.maximum(interval["Revenue_p90"], interval["Revenue"])
     interval["Revenue_p05"] = np.minimum(interval["Revenue_p05"], interval["Revenue_p10"])
@@ -142,7 +298,18 @@ def coherence_summary(submission: pd.DataFrame, weekly_pred: pd.DataFrame) -> pd
         Revenue=("Revenue", "sum"),
         COGS=("COGS", "sum"),
     )
-    summary = summary.merge(weekly_pred[["week_id", "revenue_w_pred", "cogs_w_pred"]], on="week_id", how="inner")
-    summary["revenue_drift"] = np.abs(summary["Revenue"] - summary["revenue_w_pred"]) / np.maximum(summary["revenue_w_pred"], EPS)
-    summary["cogs_drift"] = np.abs(summary["COGS"] - summary["cogs_w_pred"]) / np.maximum(summary["cogs_w_pred"], EPS)
+    keep_cols = [
+        "week_id",
+        "revenue_w_base",
+        "cogs_w_base",
+        "revenue_w_pred",
+        "cogs_w_pred",
+        "revenue_lv3_multiplier_avg",
+        "cogs_lv3_multiplier_avg",
+    ]
+    summary = summary.merge(weekly_pred[[c for c in keep_cols if c in weekly_pred.columns]], on="week_id", how="inner")
+    summary["revenue_bottomup_drift"] = np.abs(summary["Revenue"] - summary["revenue_w_pred"]) / np.maximum(summary["revenue_w_pred"], EPS)
+    summary["cogs_bottomup_drift"] = np.abs(summary["COGS"] - summary["cogs_w_pred"]) / np.maximum(summary["cogs_w_pred"], EPS)
+    summary["revenue_lv3_uplift"] = safe_div(summary["revenue_w_pred"], summary["revenue_w_base"]) - 1.0
+    summary["cogs_lv3_uplift"] = safe_div(summary["cogs_w_pred"], summary["cogs_w_base"]) - 1.0
     return summary

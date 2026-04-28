@@ -19,7 +19,7 @@ def save_artifact(df: pd.DataFrame, path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Top-down weekly-to-daily forecast pipeline")
+    parser = argparse.ArgumentParser(description="Base + Spikes weekly-baseline to daily forecast pipeline")
     parser.add_argument("--no-artifacts", action="store_true", help="Run without saving intermediate mart artifacts")
     args = parser.parse_args()
 
@@ -48,17 +48,22 @@ def main() -> None:
     if not args.no_artifacts:
         save_artifact(metrics, cfg.artifact_dir / "backtest_metrics.csv")
 
-    checkpoint("Checkpoint 4-5: final forecast, reconciliation, validation")
+    checkpoint("Checkpoint 4-5: final Base + Spikes forecast and validation")
     submission, weekly_pred, intervals = final_forecast(daily, weekly, sample)
     validate_submission(submission, sample)
     coherence = coherence_summary(submission, weekly_pred)
     if len(coherence):
         print(
-            "coherence max drift:",
+            "bottom-up max drift:",
             "Revenue",
-            f"{coherence['revenue_drift'].max():.8f}",
+            f"{coherence['revenue_bottomup_drift'].max():.8f}",
             "COGS",
-            f"{coherence['cogs_drift'].max():.8f}",
+            f"{coherence['cogs_bottomup_drift'].max():.8f}",
+            "| max LV3 uplift:",
+            "Revenue",
+            f"{coherence['revenue_lv3_uplift'].max():.4f}",
+            "COGS",
+            f"{coherence['cogs_lv3_uplift'].max():.4f}",
         )
     if not args.no_artifacts:
         save_artifact(weekly_pred, cfg.artifact_dir / "weekly_forecast.csv")
