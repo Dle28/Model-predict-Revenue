@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Notebook and tool cache
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated pipeline files
+artifacts/
+outputs/
+
+# Local data files
+Data/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
