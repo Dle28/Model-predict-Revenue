@@ -10,7 +10,7 @@ from .common import EPS, covid_allocation_regime, covid_regime_flags, safe_div
 from .lv1 import RidgeLogModel
 
 
-ALLOCATION_BLEND_CANDIDATES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30]
+ALLOCATION_BLEND_CANDIDATES = [0.0, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00]
 ALLOCATION_TUNING_WEEKS = 13
 
 LV2_FEATURE_COLUMNS = [
@@ -398,7 +398,7 @@ def _tune_allocation_blend_weight(train: pd.DataFrame, features: pd.DataFrame, t
     best_alpha = 0.0
     best_mae = float("inf")
     for alpha in ALLOCATION_BLEND_CANDIDATES:
-        score = alpha * model_score + (1.0 - alpha) * hist_score
+        score = hist_score + alpha * model_score
         pred_weight = _softmax_weights(score, train.loc[val_mask, "week_id"])
         mae = _allocation_weight_mae(actual_weight, pred_weight)
         if mae < best_mae - 1e-6:
@@ -452,7 +452,10 @@ def fit_allocation_model(
     train = _attach_historical_weight_features(hist, allocation_model)
     train = train.merge(_weekly_context(weekly_base, base_col), on="week_id", how="left")
     features = _allocation_feature_frame(train)
-    target = np.log(train["actual_weight"].clip(lower=1e-5))
+    target = np.log(
+        train["actual_weight"].clip(lower=1e-5)
+        / train["hist_weight_blend"].clip(lower=1e-5)
+    )
     usable = target.replace([np.inf, -np.inf], np.nan).notna()
     if usable.sum() >= 30:
         best_alpha, best_mae = _tune_allocation_blend_weight(train, features, target)
@@ -479,7 +482,7 @@ def allocate_base_daily_dynamic(
         model_score = np.asarray(model.model.predict(features), dtype=float)
         hist_score = np.log(out["hist_weight_blend"].clip(lower=1e-5).to_numpy())
         alpha = float(np.clip(model.score_blend_weight, 0.0, 1.0))
-        score = alpha * model_score + (1.0 - alpha) * hist_score
+        score = hist_score + alpha * model_score
     score = np.clip(score, -12.0, 2.0)
     out["_score"] = score
     group_max = out.groupby("week_id")["_score"].transform("max")

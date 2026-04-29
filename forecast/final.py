@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import numpy as np
 import pandas as pd
 
-from .common import EPS, FINAL_TRAIN_END_WEEK_ID, FINAL_TRAIN_START_WEEK_ID, add_calendar_columns, safe_div
+from .common import EPS, FINAL_TRAIN_END_WEEK_ID, FINAL_TRAIN_START_WEEK_ID, add_calendar_columns, covid_regime_flags
 from .direct import blend_direct_daily_forecast
 from .lv1 import forecast_weekly_base_recursive, historical_weekly_base
 from .lv2 import allocate_base_daily_dynamic, daily_seasonal_shim, fit_allocation_model, lv2_columns
@@ -13,6 +14,24 @@ from .lv3 import apply_spike_multiplier, fit_spike_multiplier_model
 
 
 WEEKLY_RECONCILIATION_ANCHOR_WEIGHT = 0.05
+WEEKLY_POST_LV3_MAX_DRIFT: float | None = None
+
+
+def _safe_div_series(a: pd.Series, b: pd.Series) -> pd.Series:
+    left = pd.to_numeric(a, errors="coerce")
+    right = pd.to_numeric(b, errors="coerce").abs().clip(lower=EPS)
+    return left / right
+
+
+def requested_weekly_drift_cap() -> float | None:
+    raw = os.environ.get("FORECAST_WEEKLY_DRIFT_CAP", "").strip()
+    if not raw:
+        return WEEKLY_POST_LV3_MAX_DRIFT
+    try:
+        value = float(raw)
+    except ValueError:
+        return WEEKLY_POST_LV3_MAX_DRIFT
+    return float(np.clip(value, 0.0, 1.0))
 
 
 def _train_end_date(weekly: pd.DataFrame, train_end_week_id: str, daily: pd.DataFrame) -> pd.Timestamp:
@@ -58,11 +77,11 @@ def reconcile_daily_to_weekly_anchor(
         (1.0 - blend) * anchors["COGS_bottom_up"]
         + blend * anchors["cogs_w_base"].fillna(anchors["COGS_bottom_up"])
     )
-    anchors["Revenue_scale"] = safe_div(anchors["Revenue_anchor"], anchors["Revenue_bottom_up"]).replace(
+    anchors["Revenue_scale"] = _safe_div_series(anchors["Revenue_anchor"], anchors["Revenue_bottom_up"]).replace(
         [np.inf, -np.inf],
         np.nan,
     ).fillna(1.0).clip(lower=0.50, upper=1.50)
-    anchors["COGS_scale"] = safe_div(anchors["COGS_anchor"], anchors["COGS_bottom_up"]).replace(
+    anchors["COGS_scale"] = _safe_div_series(anchors["COGS_anchor"], anchors["COGS_bottom_up"]).replace(
         [np.inf, -np.inf],
         np.nan,
     ).fillna(1.0).clip(lower=0.50, upper=1.50)
@@ -73,6 +92,96 @@ def reconcile_daily_to_weekly_anchor(
             if col in out.columns:
                 out[col] = out[col].astype(float).to_numpy() * scale
     return out.drop(columns=["Revenue_scale", "COGS_scale"])
+
+
+def apply_recovery_weekly_guardrail(daily_pred: pd.DataFrame, weekly_base: pd.DataFrame) -> pd.DataFrame:
+    out = daily_pred.copy()
+    if out.empty:
+        return out
+    base_cols = ["week_id", "week_start"]
+    baseline_cols = {
+        "Revenue": "revenue_w_pre_covid_baseline_same_week",
+        "COGS": "cogs_w_pre_covid_baseline_same_week",
+    }
+    keep_cols = base_cols + [col for col in baseline_cols.values() if col in weekly_base.columns]
+    if len(keep_cols) == len(base_cols):
+        return out
+
+    week_info = weekly_base[keep_cols].drop_duplicates("week_id").copy()
+    regime = [
+        covid_regime_flags(str(row.week_id), pd.Timestamp(str(row.week_start)))
+        for row in week_info[["week_id", "week_start"]].itertuples(index=False)
+    ]
+    week_info["recovery_phase"] = [flags["recovery_phase"] for flags in regime]
+    week_info["normalization_phase"] = [flags["normalization_phase"] for flags in regime]
+    weekly_sums = out.groupby("week_id", as_index=False).agg(
+        Revenue_sum=("Revenue", "sum"),
+        COGS_sum=("COGS", "sum"),
+    )
+    scales = weekly_sums.merge(week_info, on="week_id", how="left")
+    scale_cols = []
+    for target, baseline_col in baseline_cols.items():
+        if baseline_col not in scales.columns:
+            continue
+        sum_col = f"{target}_sum"
+        scale_col = f"{target}_recovery_guardrail_scale"
+        baseline = scales[baseline_col].replace([np.inf, -np.inf], np.nan).astype(float)
+        current = scales[sum_col].replace([np.inf, -np.inf], np.nan).astype(float)
+        normalization_mask = scales["normalization_phase"].fillna(0).gt(0) & baseline.gt(EPS) & current.lt(baseline * 0.85)
+        recovery_mask = scales["recovery_phase"].fillna(0).gt(0) & baseline.gt(EPS) & current.lt(baseline * 0.85)
+        adjusted = current.copy()
+        adjusted = adjusted.mask(recovery_mask, 0.85 * current + 0.15 * baseline)
+        adjusted = adjusted.mask(normalization_mask, 0.70 * current + 0.30 * baseline)
+        scales[scale_col] = _safe_div_series(adjusted, current).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=1.0)
+        scale_cols.append(scale_col)
+    if not scale_cols:
+        return out
+    out = out.merge(scales[["week_id"] + scale_cols], on="week_id", how="left")
+    for target in ["Revenue", "COGS"]:
+        scale_col = f"{target}_recovery_guardrail_scale"
+        if scale_col not in out.columns:
+            continue
+        scale = out[scale_col].fillna(1.0).to_numpy()
+        for col in [target, f"{target}_p10", f"{target}_p90", f"{target}_p05", f"{target}_p95"]:
+            if col in out.columns:
+                out[col] = out[col].astype(float).to_numpy() * scale
+    return out.drop(columns=scale_cols)
+
+
+def cap_weekly_drift_to_base(
+    daily_pred: pd.DataFrame,
+    weekly_base: pd.DataFrame,
+    max_drift: float | None = WEEKLY_POST_LV3_MAX_DRIFT,
+) -> pd.DataFrame:
+    out = daily_pred.copy()
+    if out.empty or max_drift is None:
+        return out
+    cap = float(np.clip(max_drift, 0.0, 1.0))
+    weekly_sums = out.groupby("week_id", as_index=False).agg(
+        Revenue_sum=("Revenue", "sum"),
+        COGS_sum=("COGS", "sum"),
+    )
+    scales = weekly_sums.merge(
+        weekly_base[["week_id", "revenue_w_base", "cogs_w_base"]],
+        on="week_id",
+        how="left",
+    )
+    scale_cols = []
+    for target, base_col in [("Revenue", "revenue_w_base"), ("COGS", "cogs_w_base")]:
+        current = scales[f"{target}_sum"].replace([np.inf, -np.inf], np.nan).astype(float)
+        base = scales[base_col].replace([np.inf, -np.inf], np.nan).astype(float)
+        capped = current.clip(lower=base * (1.0 - cap), upper=base * (1.0 + cap))
+        scale_col = f"{target}_weekly_drift_cap_scale"
+        scales[scale_col] = _safe_div_series(capped, current).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        scale_cols.append(scale_col)
+    out = out.merge(scales[["week_id"] + scale_cols], on="week_id", how="left")
+    for target in ["Revenue", "COGS"]:
+        scale_col = f"{target}_weekly_drift_cap_scale"
+        scale = out[scale_col].fillna(1.0).to_numpy()
+        for col in [target, f"{target}_p10", f"{target}_p90", f"{target}_p05", f"{target}_p95"]:
+            if col in out.columns:
+                out[col] = out[col].astype(float).to_numpy() * scale
+    return out.drop(columns=scale_cols)
 
 
 def forecast_daily_base_spikes(
@@ -183,6 +292,8 @@ def forecast_daily_base_spikes(
     )
     daily_pred = blend_direct_daily_forecast(daily, daily_pred, train_start_date, train_end_date)
     daily_pred = reconcile_daily_to_weekly_anchor(daily_pred, weekly_base)
+    daily_pred = apply_recovery_weekly_guardrail(daily_pred, weekly_base)
+    daily_pred = cap_weekly_drift_to_base(daily_pred, weekly_base, requested_weekly_drift_cap())
 
     weekly_bottom_up = daily_pred.groupby("week_id", as_index=False).agg(
         revenue_w_pred=("Revenue", "sum"),
@@ -310,6 +421,10 @@ def coherence_summary(submission: pd.DataFrame, weekly_pred: pd.DataFrame) -> pd
     summary = summary.merge(weekly_pred[[c for c in keep_cols if c in weekly_pred.columns]], on="week_id", how="inner")
     summary["revenue_bottomup_drift"] = np.abs(summary["Revenue"] - summary["revenue_w_pred"]) / np.maximum(summary["revenue_w_pred"], EPS)
     summary["cogs_bottomup_drift"] = np.abs(summary["COGS"] - summary["cogs_w_pred"]) / np.maximum(summary["cogs_w_pred"], EPS)
-    summary["revenue_lv3_uplift"] = safe_div(summary["revenue_w_pred"], summary["revenue_w_base"]) - 1.0
-    summary["cogs_lv3_uplift"] = safe_div(summary["cogs_w_pred"], summary["cogs_w_base"]) - 1.0
+    summary["revenue_weekly_sum_ratio"] = _safe_div_series(summary["Revenue"], summary["revenue_w_base"]).replace([np.inf, -np.inf], np.nan)
+    summary["cogs_weekly_sum_ratio"] = _safe_div_series(summary["COGS"], summary["cogs_w_base"]).replace([np.inf, -np.inf], np.nan)
+    summary["revenue_weekly_drift"] = (summary["revenue_weekly_sum_ratio"] - 1.0).abs()
+    summary["cogs_weekly_drift"] = (summary["cogs_weekly_sum_ratio"] - 1.0).abs()
+    summary["revenue_lv3_uplift"] = _safe_div_series(summary["revenue_w_pred"], summary["revenue_w_base"]) - 1.0
+    summary["cogs_lv3_uplift"] = _safe_div_series(summary["cogs_w_pred"], summary["cogs_w_base"]) - 1.0
     return summary

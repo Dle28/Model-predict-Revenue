@@ -35,8 +35,8 @@ TARGETS = {
     "COGS": "cogs",
 }
 
-FINAL_TRAIN_START_WEEK_ID = "2012-W28"
-FINAL_TRAIN_END_WEEK_ID = "2022-W52"
+FINAL_TRAIN_START_WEEK_ID = "2015-W01"
+FINAL_TRAIN_END_WEEK_ID = "2021-W52"
 
 PRE_COVID_END_WEEK_ID = "2019-W52"
 COVID_DROP_START_WEEK_ID = "2020-W01"
@@ -46,12 +46,13 @@ RECOVERY_END_WEEK_ID = "2023-W52"
 NORMALIZATION_START_WEEK_ID = "2024-W01"
 COVID_START_DATE = pd.Timestamp("2020-01-01")
 RECOVERY_START_DATE = pd.Timestamp("2023-01-01")
+RECOVERY_PROGRESS_TAU_WEEKS = 32.0
 
 
 FOLDS = [
     # Diagnostic holdout only. The final model trains from FINAL_TRAIN_START_WEEK_ID
     # through FINAL_TRAIN_END_WEEK_ID before forecasting 2023-2024.
-    ("2017-W01", "2019-W52", "2020-W01", "2022-W51"),
+    ("2015-W01", "2021-W52", "2022-W01", "2022-W51"),
 ]
 
 
@@ -83,7 +84,7 @@ def covid_regime_flags(week_id: str, week_start: pd.Timestamp) -> dict[str, floa
     week_start = pd.Timestamp(week_start)
     weeks_since_covid_start = max(float((week_start - COVID_START_DATE).days) / 7.0, 0.0)
     weeks_since_recovery_start = max(float((week_start - RECOVERY_START_DATE).days) / 7.0, 0.0)
-    recovery_progress = float(np.clip(weeks_since_recovery_start / 104.0, 0.0, 1.0))
+    recovery_progress = float(np.clip(1.0 - np.exp(-weeks_since_recovery_start / RECOVERY_PROGRESS_TAU_WEEKS), 0.0, 1.0))
     return {
         "pre_covid": float(week_id <= PRE_COVID_END_WEEK_ID),
         "covid_drop": float(COVID_DROP_START_WEEK_ID <= week_id <= COVID_DROP_END_WEEK_ID),

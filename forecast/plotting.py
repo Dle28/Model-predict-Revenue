@@ -8,6 +8,305 @@ import numpy as np
 import pandas as pd
 
 
+def save_recovery_anchor_plot(recovery_diag: pd.DataFrame, path: Path) -> None:
+    if recovery_diag.empty:
+        return
+    frame = recovery_diag.copy()
+    frame["week_start"] = pd.to_datetime(frame["week_start"])
+
+    def none_if_nan(value: Any) -> Optional[float]:
+        if pd.isna(value):
+            return None
+        return round(float(value), 2)
+
+    records = []
+    for row in frame.itertuples(index=False):
+        record = {
+            "weekId": getattr(row, "week_id"),
+            "weekStart": pd.Timestamp(getattr(row, "week_start")).strftime("%Y-%m-%d"),
+        }
+        for target in ["revenue", "cogs"]:
+            mapping = {
+                f"{target}Base": f"{target}_w_base",
+                f"{target}Final": f"{target}_w_pred",
+                f"{target}Baseline": f"{target}_w_pre_covid_baseline_same_week",
+                f"{target}Anchor": f"{target}_w_recovery_anchor",
+                f"{target}Progress": f"{target}_w_recovery_progress",
+            }
+            for key, col in mapping.items():
+                record[key] = none_if_nan(getattr(row, col)) if hasattr(row, col) else None
+        records.append(record)
+
+    html = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Recovery Anchor Diagnostic</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --ink: #17202a;
+      --muted: #667085;
+      --grid: #e5e7eb;
+      --panel: #fff;
+      --forecast: #2563eb;
+      --baseline: #dc2626;
+      --anchor: #059669;
+      --final: #7c3aed;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1240px; margin: 0 auto; padding: 24px; }
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0; }
+    .subtle { color: var(--muted); }
+    .controls {
+      display: inline-flex;
+      padding: 4px;
+      border: 1px solid var(--grid);
+      border-radius: 8px;
+      background: var(--panel);
+      gap: 4px;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button.active { background: #111827; color: #fff; }
+    .chart-panel {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--grid);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    canvas { display: block; width: 100%; height: 560px; }
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin: 10px 4px 0;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 22px; height: 3px; border-radius: 999px; display: inline-block; }
+    .forecast { background: var(--forecast); }
+    .final { background: var(--final); }
+    .baseline { background: var(--baseline); }
+    .anchor { background: var(--anchor); }
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(17, 24, 39, 0.94);
+      color: #fff;
+      border-radius: 8px;
+      padding: 9px 10px;
+      font-size: 12px;
+      min-width: 210px;
+      transform: translate(-50%, -110%);
+      display: none;
+      z-index: 2;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Recovery Anchor Diagnostic</h1>
+        <div class="subtle">Weekly forecast versus pre-COVID baseline and recovery anchor</div>
+      </div>
+      <div class="controls" aria-label="Metric selector">
+        <button id="revenueBtn" class="active" type="button">Revenue</button>
+        <button id="cogsBtn" type="button">COGS</button>
+      </div>
+    </header>
+    <section class="chart-panel">
+      <canvas id="chart"></canvas>
+      <div class="tooltip" id="tooltip"></div>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch forecast"></span>LV1 base</span>
+        <span class="legend-item"><span class="swatch final"></span>Final weekly sum</span>
+        <span class="legend-item"><span class="swatch baseline"></span>Pre-COVID baseline</span>
+        <span class="legend-item"><span class="swatch anchor"></span>Recovery anchor</span>
+      </div>
+    </section>
+  </main>
+  <script>
+    const DATA = __DATA_JSON__;
+    const canvas = document.getElementById("chart");
+    const ctx = canvas.getContext("2d");
+    const tooltip = document.getElementById("tooltip");
+    const revenueBtn = document.getElementById("revenueBtn");
+    const cogsBtn = document.getElementById("cogsBtn");
+    let metric = "revenue";
+    let hoverIndex = null;
+
+    function money(value) {
+      if (value === null || value === undefined || Number.isNaN(value)) return "-";
+      return "VND " + Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
+    function keys() {
+      if (metric === "revenue") {
+        return { base: "revenueBase", final: "revenueFinal", baseline: "revenueBaseline", anchor: "revenueAnchor", progress: "revenueProgress" };
+      }
+      return { base: "cogsBase", final: "cogsFinal", baseline: "cogsBaseline", anchor: "cogsAnchor", progress: "cogsProgress" };
+    }
+    function bounds(k) {
+      const vals = [];
+      DATA.forEach(row => [k.base, k.final, k.baseline, k.anchor].forEach(key => {
+        const v = row[key];
+        if (v !== null && Number.isFinite(v)) vals.push(v);
+      }));
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+      const pad = (max - min) * 0.08 || max * 0.08 || 1;
+      return { min: Math.max(0, min - pad), max: max + pad };
+    }
+    function drawLine(points, color, width, dash = []) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.setLineDash(dash);
+      ctx.beginPath();
+      let open = false;
+      points.forEach(p => {
+        if (p.y === null) {
+          open = false;
+          return;
+        }
+        if (!open) {
+          ctx.moveTo(p.x, p.y);
+          open = true;
+        } else {
+          ctx.lineTo(p.x, p.y);
+        }
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      draw();
+    }
+    function draw() {
+      const isRevenue = metric === "revenue";
+      revenueBtn.classList.toggle("active", isRevenue);
+      cogsBtn.classList.toggle("active", !isRevenue);
+      const rect = canvas.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+      const pad = { left: 74, right: 24, top: 20, bottom: 42 };
+      const plotW = w - pad.left - pad.right;
+      const plotH = h - pad.top - pad.bottom;
+      const k = keys();
+      const b = bounds(k);
+      const x = i => pad.left + (DATA.length <= 1 ? 0 : i * plotW / (DATA.length - 1));
+      const y = v => pad.top + (b.max - v) * plotH / (b.max - b.min);
+
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = "#e5e7eb";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#667085";
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i <= 5; i++) {
+        const val = b.min + (b.max - b.min) * i / 5;
+        const yy = y(val);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, yy);
+        ctx.lineTo(w - pad.right, yy);
+        ctx.stroke();
+        ctx.fillText(money(val), pad.left - 8, yy);
+      }
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      [0, Math.floor(DATA.length * 0.25), Math.floor(DATA.length * 0.5), Math.floor(DATA.length * 0.75), DATA.length - 1].forEach(i => {
+        ctx.fillText(DATA[i].weekStart, x(i), h - pad.bottom + 16);
+      });
+
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.baseline] === null ? null : y(row[k.baseline]) })), "#dc2626", 2, [6, 4]);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.anchor] === null ? null : y(row[k.anchor]) })), "#059669", 2.5);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.final] === null ? null : y(row[k.final]) })), "#7c3aed", 2);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.base] === null ? null : y(row[k.base]) })), "#2563eb", 2.5);
+
+      if (hoverIndex !== null) {
+        const row = DATA[hoverIndex];
+        const xx = x(hoverIndex);
+        const anchorY = row[k.base] !== null ? y(row[k.base]) : pad.top;
+        ctx.strokeStyle = "#111827";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xx, pad.top);
+        ctx.lineTo(xx, h - pad.bottom);
+        ctx.stroke();
+        tooltip.style.display = "block";
+        tooltip.style.left = `${Math.min(Math.max(xx, 120), w - 120)}px`;
+        tooltip.style.top = `${Math.max(anchorY, 90)}px`;
+        tooltip.innerHTML = `
+          <strong>${row.weekId}</strong><br>
+          LV1 base: ${money(row[k.base])}<br>
+          Final sum: ${money(row[k.final])}<br>
+          Pre-COVID baseline: ${money(row[k.baseline])}<br>
+          Recovery anchor: ${money(row[k.anchor])}<br>
+          Progress: ${row[k.progress] === null ? "-" : (Number(row[k.progress]) * 100).toFixed(1) + "%"}
+        `;
+      } else {
+        tooltip.style.display = "none";
+      }
+    }
+    canvas.addEventListener("mousemove", event => {
+      const rect = canvas.getBoundingClientRect();
+      const xPos = event.clientX - rect.left;
+      const plotW = rect.width - 74 - 24;
+      const idx = Math.round((xPos - 74) * (DATA.length - 1) / plotW);
+      hoverIndex = Math.min(Math.max(idx, 0), DATA.length - 1);
+      draw();
+    });
+    canvas.addEventListener("mouseleave", () => {
+      hoverIndex = null;
+      draw();
+    });
+    revenueBtn.addEventListener("click", () => { metric = "revenue"; draw(); });
+    cogsBtn.addEventListener("click", () => { metric = "cogs"; draw(); });
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+  </script>
+</body>
+</html>
+"""
+    html = html.replace("__DATA_JSON__", json.dumps(records, separators=(",", ":")))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+    print(f"saved {path} ({len(records)} plotted weeks)")
+
+
 def save_submission_plot(
     submission: pd.DataFrame,
     intervals: pd.DataFrame,
@@ -293,7 +592,7 @@ def save_submission_plot(
 
     function money(value) {
       if (value === null || value === undefined || Number.isNaN(value)) return "-";
-      return "$" + Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 });
+      return "VND " + Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 });
     }
     function pct(value) {
       if (value === null || value === undefined || Number.isNaN(value)) return "-";

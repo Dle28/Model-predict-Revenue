@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -65,74 +65,151 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
     if "day_of_year" not in df.columns and "date" in df.columns:
         day_of_year = date.dt.dayofyear.astype(float)
 
-    out = pd.DataFrame(index=df.index)
-    out["bias"] = 1.0
     lv2_base = _numeric_feature(df, "lv2_base_value")
-    out["log_lv2_base"] = np.log1p(lv2_base)
+    features: Dict[str, Any] = {
+        "bias": 1.0,
+        "log_lv2_base": np.log1p(lv2_base),
+    }
+    if "week_id" in df.columns:
+        week_start = pd.to_datetime(df["week_start"]) if "week_start" in df.columns else date
+        flags = [covid_regime_flags(str(wid), wstart) for wid, wstart in zip(df["week_id"].astype(str), week_start)]
+        flag_frame = pd.DataFrame(flags, index=df.index)
+        for col in [
+            "pre_covid",
+            "covid_drop",
+            "recovery_phase",
+            "normalization_phase",
+            "weeks_since_covid_start",
+            "weeks_since_recovery_start",
+            "recovery_progress",
+        ]:
+            features[col] = flag_frame[col].astype(float)
+    else:
+        for col in [
+            "pre_covid",
+            "covid_drop",
+            "recovery_phase",
+            "normalization_phase",
+            "weeks_since_covid_start",
+            "weeks_since_recovery_start",
+            "recovery_progress",
+        ]:
+            features[col] = 0.0
     if "week_id" in df.columns:
         week_sum = lv2_base.groupby(df["week_id"]).transform("sum")
         week_mean = lv2_base.groupby(df["week_id"]).transform("mean")
-        out["base_share_in_week"] = safe_div(lv2_base, week_sum).replace([np.inf, -np.inf], np.nan).fillna(1.0 / 7.0)
-        out["base_vs_week_mean"] = safe_div(lv2_base, week_mean).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        out["base_rank_in_week"] = lv2_base.groupby(df["week_id"]).rank(pct=True).fillna(0.5)
+        features["base_share_in_week"] = safe_div(lv2_base, week_sum).replace([np.inf, -np.inf], np.nan).fillna(1.0 / 7.0)
+        features["base_vs_week_mean"] = safe_div(lv2_base, week_mean).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        features["base_rank_in_week"] = lv2_base.groupby(df["week_id"]).rank(pct=True).fillna(0.5)
     else:
-        out["base_share_in_week"] = 1.0 / 7.0
-        out["base_vs_week_mean"] = 1.0
-        out["base_rank_in_week"] = 0.5
+        features["base_share_in_week"] = 1.0 / 7.0
+        features["base_vs_week_mean"] = 1.0
+        features["base_rank_in_week"] = 0.5
+    weekly_base_value = _numeric_feature(df, "weekly_base_value")
+    if "week_id" in df.columns:
+        weekly_base_value = weekly_base_value.where(weekly_base_value.gt(EPS), lv2_base.groupby(df["week_id"]).transform("sum"))
+    else:
+        weekly_base_value = weekly_base_value.where(weekly_base_value.gt(EPS), lv2_base * 7.0)
+    if "pre_covid_baseline_same_week" in df.columns:
+        pre_covid_baseline = df["pre_covid_baseline_same_week"].replace([np.inf, -np.inf], np.nan).astype(float)
+    else:
+        pre_covid_baseline = pd.Series(np.nan, index=df.index, dtype=float)
+    base_vs_precovid = safe_div(weekly_base_value, pre_covid_baseline).replace([np.inf, -np.inf], np.nan)
+    base_vs_precovid_baseline = base_vs_precovid.fillna(1.0).clip(lower=0.0, upper=2.0)
+    recovery_gap = (1.0 - base_vs_precovid_baseline).clip(lower=-0.5, upper=0.7)
+    features["base_vs_precovid_baseline"] = base_vs_precovid_baseline
+    features["recovery_gap"] = recovery_gap
     for weekday in range(1, 8):
-        out[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
+        features[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
     for month_id in range(1, 13):
-        out[f"month_{month_id}"] = month.eq(month_id).astype(float)
-    out["dom_sin"] = np.sin(2 * np.pi * day_of_month / 31.0)
-    out["dom_cos"] = np.cos(2 * np.pi * day_of_month / 31.0)
-    out["doy_sin"] = np.sin(2 * np.pi * day_of_year / 366.0)
-    out["doy_cos"] = np.cos(2 * np.pi * day_of_year / 366.0)
-    out["is_payday_window"] = _numeric_feature(df, "is_payday_window")
-    out["is_holiday"] = _numeric_feature(df, "is_holiday")
-    out["is_month_start"] = _numeric_feature(df, "is_month_start")
-    out["is_month_end"] = _numeric_feature(df, "is_month_end")
-    out["is_tet_window"] = _numeric_feature(df, "is_tet_window")
-    out["is_black_friday_window"] = _numeric_feature(df, "is_black_friday_window")
-    out["is_double_day_sale"] = (
+        features[f"month_{month_id}"] = month.eq(month_id).astype(float)
+    features["dom_sin"] = np.sin(2 * np.pi * day_of_month / 31.0)
+    features["dom_cos"] = np.cos(2 * np.pi * day_of_month / 31.0)
+    features["doy_sin"] = np.sin(2 * np.pi * day_of_year / 366.0)
+    features["doy_cos"] = np.cos(2 * np.pi * day_of_year / 366.0)
+    is_payday_window = _numeric_feature(df, "is_payday_window")
+    is_holiday = _numeric_feature(df, "is_holiday")
+    is_tet_window = _numeric_feature(df, "is_tet_window")
+    is_black_friday_window = _numeric_feature(df, "is_black_friday_window")
+    is_double_day_sale = (
         _numeric_feature(df, "is_double_day_sale")
         if "is_double_day_sale" in df.columns
         else ((month == day_of_month) & month.isin([9, 10, 11, 12])).astype(float)
     )
-    out["is_1111_1212"] = (
+    is_1111_1212 = (
         _numeric_feature(df, "is_1111_1212")
         if "is_1111_1212" in df.columns
         else (((month == 11) & (day_of_month == 11)) | ((month == 12) & (day_of_month == 12))).astype(float)
     )
-    out["is_year_end_window"] = (
+    is_year_end_window = (
         _numeric_feature(df, "is_year_end_window")
         if "is_year_end_window" in df.columns
         else ((month == 12) & day_of_month.ge(15)).astype(float)
     )
-    out["is_new_year_window"] = (
+    is_new_year_window = (
         _numeric_feature(df, "is_new_year_window")
         if "is_new_year_window" in df.columns
         else ((month == 1) & day_of_month.le(7)).astype(float)
     )
+    features.update(
+        {
+            "is_payday_window": is_payday_window,
+            "is_holiday": is_holiday,
+            "is_month_start": _numeric_feature(df, "is_month_start"),
+            "is_month_end": _numeric_feature(df, "is_month_end"),
+            "is_tet_window": is_tet_window,
+            "is_black_friday_window": is_black_friday_window,
+            "is_double_day_sale": is_double_day_sale,
+            "is_1111_1212": is_1111_1212,
+            "is_year_end_window": is_year_end_window,
+            "is_new_year_window": is_new_year_window,
+        }
+    )
 
     for col in SPIKE_ACTIVITY_COLUMNS:
         raw = _numeric_feature(df, col)
-        out[col] = raw
-        out[f"log1p_{col}"] = np.log1p(raw.clip(lower=0.0))
-    out["orders_per_session_safe"] = safe_div(_numeric_feature(df, "orders_count"), _numeric_feature(df, "sessions"))
+        features[col] = raw
+        features[f"log1p_{col}"] = np.log1p(raw.clip(lower=0.0))
+    features["orders_per_session_safe"] = safe_div(_numeric_feature(df, "orders_count"), _numeric_feature(df, "sessions"))
     revenue_lag7 = _numeric_feature(df, "revenue_lag_7d")
     cogs_lag7 = _numeric_feature(df, "cogs_lag_7d")
     target_lag7 = revenue_lag7.where(revenue_lag7.gt(0), cogs_lag7)
-    out["lag7_vs_base"] = safe_div(target_lag7, lv2_base).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.0, 5.0)
-    out["event_intensity"] = (
-        out["is_holiday"]
-        + out["is_tet_window"]
-        + out["is_black_friday_window"]
-        + out["is_double_day_sale"]
-        + out["is_1111_1212"]
-        + out["is_payday_window"]
+    features["lag7_vs_base"] = safe_div(target_lag7, lv2_base).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.0, 5.0)
+    event_intensity = (
+        is_holiday
+        + is_tet_window
+        + is_black_friday_window
+        + is_double_day_sale
+        + is_1111_1212
+        + is_payday_window
         + _numeric_feature(df, "active_promo_count").clip(lower=0.0, upper=3.0)
     )
-    return out
+    recovery_progress = features["recovery_progress"]
+    features["event_intensity"] = event_intensity
+    features["event_intensity_x_recovery_progress"] = event_intensity * recovery_progress
+    features["recovery_gap_x_recovery_progress"] = recovery_gap * recovery_progress
+    return pd.DataFrame(features, index=df.index).copy()
+
+
+def fit_spike_classifier(X: pd.DataFrame, y: pd.Series) -> Any:
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                C=0.75,
+                class_weight="balanced",
+                max_iter=1000,
+                random_state=42,
+            ),
+        )
+        model.fit(X, y.astype(int))
+        return model
+    except Exception:
+        return RidgeLogModel(alpha=350.0).fit(X, y.astype(float))
 
 
 class SpikeMultiplierModel:
@@ -148,8 +225,8 @@ class SpikeMultiplierModel:
         self.min_multiplier = min_multiplier
         self.max_multiplier = max_multiplier
         self.model: Optional[RidgeLogModel] = None
-        self.up_classifier: Optional[RidgeLogModel] = None
-        self.down_classifier: Optional[RidgeLogModel] = None
+        self.up_classifier: Optional[Any] = None
+        self.down_classifier: Optional[Any] = None
         self.up_model: Optional[RidgeLogModel] = None
         self.down_model: Optional[RidgeLogModel] = None
         self.normal_model: Optional[RidgeLogModel] = None
@@ -187,9 +264,9 @@ class SpikeMultiplierModel:
             up_label = clean_multiplier.ge(self.up_threshold).astype(float)
             down_label = clean_multiplier.le(self.down_threshold).astype(float)
             if up_label.sum() >= 10 and up_label.sum() < len(up_label):
-                self.up_classifier = RidgeLogModel(alpha=350.0).fit(X, up_label)
+                self.up_classifier = fit_spike_classifier(X, up_label)
             if down_label.sum() >= 10 and down_label.sum() < len(down_label):
-                self.down_classifier = RidgeLogModel(alpha=350.0).fit(X, down_label)
+                self.down_classifier = fit_spike_classifier(X, down_label)
             normal_mask = ~(up_label.astype(bool) | down_label.astype(bool))
             if normal_mask.sum() >= 20:
                 self.normal_model = RidgeLogModel(alpha=150.0).fit(X.loc[normal_mask], y.loc[normal_mask])
@@ -210,9 +287,13 @@ class SpikeMultiplierModel:
             return np.full(len(X), fallback, dtype=float)
         return np.asarray(model.predict(X), dtype=float)
 
-    def _predict_probability(self, model: Optional[RidgeLogModel], X: pd.DataFrame) -> np.ndarray:
+    def _predict_probability(self, model: Optional[Any], X: pd.DataFrame) -> np.ndarray:
         if model is None:
             return np.zeros(len(X), dtype=float)
+        if hasattr(model, "predict_proba"):
+            proba = np.asarray(model.predict_proba(X), dtype=float)
+            if proba.ndim == 2 and proba.shape[1] >= 2:
+                return proba[:, 1].clip(0.0, 0.55)
         return np.asarray(model.predict(X), dtype=float).clip(0.0, 0.45)
 
     def predict_multiplier(self, X: pd.DataFrame) -> np.ndarray:
@@ -259,7 +340,11 @@ def _prepare_base_join(
     base_daily: pd.DataFrame,
     base_col: str,
 ) -> pd.DataFrame:
-    out = daily.merge(base_daily[["date", base_col]], on="date", how="left")
+    join_cols = ["date", base_col]
+    for col in ["weekly_base_value", "pre_covid_baseline_same_week", "recovery_progress"]:
+        if col in base_daily.columns:
+            join_cols.append(col)
+    out = daily.merge(base_daily[join_cols], on="date", how="left")
     out = out.rename(columns={base_col: "lv2_base_value"})
     return out
 
@@ -289,38 +374,7 @@ def _fill_unknown_future_activity(df: pd.DataFrame, model: SpikeMultiplierModel)
 
 
 def tactical_event_floor(df: pd.DataFrame, target_output_col: str) -> np.ndarray:
-    floor = np.ones(len(df), dtype=float)
-    is_holiday = _numeric_feature(df, "is_holiday").gt(0).to_numpy()
-    is_tet = _numeric_feature(df, "is_tet_window").gt(0).to_numpy()
-    is_black_friday = _numeric_feature(df, "is_black_friday_window").gt(0).to_numpy()
-    is_double_day = _numeric_feature(df, "is_double_day_sale").gt(0).to_numpy()
-    is_1111_1212 = _numeric_feature(df, "is_1111_1212").gt(0).to_numpy()
-    is_year_end = _numeric_feature(df, "is_year_end_window").gt(0).to_numpy()
-    is_new_year = _numeric_feature(df, "is_new_year_window").gt(0).to_numpy()
-    has_promo = _numeric_feature(df, "active_promo_count").gt(0).to_numpy()
-    strong_discount = _numeric_feature(df, "avg_promo_discount_value").ge(15).to_numpy()
-
-    if target_output_col == "Revenue":
-        floor = np.where(is_holiday, np.maximum(floor, 1.10), floor)
-        floor = np.where(is_new_year, np.maximum(floor, 1.18), floor)
-        floor = np.where(is_tet, np.maximum(floor, 1.25), floor)
-        floor = np.where(is_year_end, np.maximum(floor, 1.25), floor)
-        floor = np.where(is_double_day, np.maximum(floor, 1.35), floor)
-        floor = np.where(is_black_friday, np.maximum(floor, 1.45), floor)
-        floor = np.where(is_1111_1212, np.maximum(floor, 1.65), floor)
-        floor = np.where(has_promo, np.maximum(floor, 1.12), floor)
-        floor = np.where(has_promo & strong_discount, np.maximum(floor, 1.25), floor)
-    else:
-        floor = np.where(is_holiday, np.maximum(floor, 1.08), floor)
-        floor = np.where(is_new_year, np.maximum(floor, 1.15), floor)
-        floor = np.where(is_tet, np.maximum(floor, 1.22), floor)
-        floor = np.where(is_year_end, np.maximum(floor, 1.22), floor)
-        floor = np.where(is_double_day, np.maximum(floor, 1.30), floor)
-        floor = np.where(is_black_friday, np.maximum(floor, 1.38), floor)
-        floor = np.where(is_1111_1212, np.maximum(floor, 1.55), floor)
-        floor = np.where(has_promo, np.maximum(floor, 1.10), floor)
-        floor = np.where(has_promo & strong_discount, np.maximum(floor, 1.20), floor)
-    return floor
+    return np.full(len(df), LV3_MULTIPLIER_MIN, dtype=float)
 
 
 def fit_spike_multiplier_model(
@@ -355,8 +409,9 @@ def apply_spike_multiplier(
     raw_pred = _prepare_base_join(future_daily, base_daily, base_col)
     pred = _fill_unknown_future_activity(raw_pred, model)
     features = spike_features(pred)
-    multiplier = model.predict_multiplier(features)
-    multiplier = np.maximum(multiplier, tactical_event_floor(raw_pred, target_output_col)).clip(
+    raw_multiplier = model.predict_multiplier(features)
+    floor_multiplier = tactical_event_floor(raw_pred, target_output_col)
+    multiplier = np.maximum(raw_multiplier, floor_multiplier).clip(
         model.min_multiplier,
         model.max_multiplier,
     )
@@ -367,6 +422,11 @@ def apply_spike_multiplier(
 
     out = pred[["date", "week_id", "week_start", "lv2_base_value"]].copy()
     out[f"{target_output_col}_lv2_base"] = out["lv2_base_value"].clip(lower=0.0)
+    out[f"{target_output_col}_lv3_raw_multiplier"] = raw_multiplier
+    out[f"{target_output_col}_event_floor_multiplier"] = floor_multiplier
+    out[f"{target_output_col}_event_floor_applied"] = (floor_multiplier > (raw_multiplier + 1e-9)).astype(float)
+    out[f"{target_output_col}_before_floor"] = out[f"{target_output_col}_lv2_base"] * raw_multiplier
+    out[f"{target_output_col}_after_floor"] = out[f"{target_output_col}_lv2_base"] * multiplier
     out[f"{target_output_col}_lv3_multiplier"] = multiplier
     out[target_output_col] = out[f"{target_output_col}_lv2_base"] * out[f"{target_output_col}_lv3_multiplier"]
     out[f"{target_output_col}_p10"] = out[f"{target_output_col}_lv2_base"] * lo80

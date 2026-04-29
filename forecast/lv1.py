@@ -116,6 +116,11 @@ MODEL_BACKEND_ALIASES = {
 }
 MODEL_BACKENDS = {"ridge", "lightgbm", "xgboost", "auto"}
 DEFAULT_MODEL_BACKEND = "ridge"
+LV1_TARGET_MODES = {"smooth", "raw", "raw_plus_smooth_lag"}
+DEFAULT_LV1_TARGET_MODE = "raw"
+PRECOVID_BASELINE_START_YEAR = 2015
+PRECOVID_BASELINE_END_YEAR = 2018
+PRECOVID_BASELINE_QUANTILE = 0.60
 
 
 LV1_BASE_WEEKLY_FEATURES = [
@@ -367,6 +372,12 @@ def requested_model_backend() -> str:
     return backend if backend in MODEL_BACKENDS else DEFAULT_MODEL_BACKEND
 
 
+def requested_lv1_target_mode() -> str:
+    mode = os.environ.get("FORECAST_LV1_TARGET_MODE", DEFAULT_LV1_TARGET_MODE).strip().lower()
+    mode = mode.replace("-", "_")
+    return mode if mode in LV1_TARGET_MODES else DEFAULT_LV1_TARGET_MODE
+
+
 def smooth_weekly_target(values: pd.Series, window: int = SMOOTH_WINDOW_WEEKS) -> pd.Series:
     clean = values.replace([np.inf, -np.inf], np.nan).astype(float)
     return clean.rolling(window=window, min_periods=1).mean()
@@ -377,6 +388,21 @@ def lv1_target_series(weekly: pd.DataFrame, target_col: str) -> pd.Series:
     if target_without_holiday in weekly.columns:
         return weekly[target_without_holiday].replace([np.inf, -np.inf], np.nan).astype(float)
     return weekly[target_col].replace([np.inf, -np.inf], np.nan).astype(float)
+
+
+def lv1_training_target_and_feature_values(
+    weekly: pd.DataFrame,
+    target_col: str,
+    known_mask: pd.Series,
+) -> Tuple[pd.Series, pd.Series]:
+    raw_values = lv1_target_series(weekly, target_col).where(known_mask)
+    smooth_values = smooth_weekly_target(raw_values)
+    mode = requested_lv1_target_mode()
+    if mode == "raw":
+        return raw_values, raw_values
+    if mode == "raw_plus_smooth_lag":
+        return raw_values, smooth_values
+    return smooth_values, smooth_values
 
 
 def training_week_mask(
@@ -510,6 +536,12 @@ def median_finite(values: Iterable[float], fallback: float = np.nan) -> float:
     return float(np.nanmedian(finite)) if len(finite) else fallback
 
 
+def quantile_finite(values: Iterable[float], q: float, fallback: float = np.nan) -> float:
+    arr = np.asarray(list(values), dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(np.nanquantile(finite, q)) if len(finite) else fallback
+
+
 def _neighbor_iso_weeks(iso_week: int) -> List[int]:
     return sorted({((int(iso_week) - 2) % 53) + 1, int(iso_week), (int(iso_week) % 53) + 1})
 
@@ -524,15 +556,23 @@ def make_precovid_reference_maps(weekly: pd.DataFrame, values: pd.Series) -> Dic
     frame["value"] = values.replace([np.inf, -np.inf], np.nan).astype(float).to_numpy()
     finite = frame["value"].notna() & np.isfinite(frame["value"])
 
-    pre = frame[finite & frame["iso_year"].between(2017, 2019)].copy()
+    pre = frame[finite & frame["iso_year"].between(PRECOVID_BASELINE_START_YEAR, PRECOVID_BASELINE_END_YEAR)].copy()
     all_finite = frame[finite].copy()
     fallback_pre = median_finite(pre["value"], median_finite(all_finite["value"], 0.0))
-    median_same_week = pre.groupby("iso_week")["value"].median().to_dict() if len(pre) else {}
+    baseline_same_week = (
+        pre.groupby("iso_week")["value"].quantile(PRECOVID_BASELINE_QUANTILE).to_dict()
+        if len(pre)
+        else {}
+    )
 
     baseline_by_week: Dict[int, float] = {}
     for week in range(1, 54):
-        same_week = float(median_same_week.get(week, np.nan))
-        neighbor = median_finite(pre.loc[pre["iso_week"].isin(_neighbor_iso_weeks(week)), "value"], fallback_pre)
+        same_week = float(baseline_same_week.get(week, np.nan))
+        neighbor = quantile_finite(
+            pre.loc[pre["iso_week"].isin(_neighbor_iso_weeks(week)), "value"],
+            PRECOVID_BASELINE_QUANTILE,
+            fallback_pre,
+        )
         if np.isfinite(same_week) and np.isfinite(neighbor):
             baseline = 0.6 * same_week + 0.4 * neighbor
         elif np.isfinite(same_week):
@@ -770,6 +810,40 @@ def dynamic_model_weight(feat: Dict[str, float]) -> float:
     return float(np.clip(base, 0.0, 0.90))
 
 
+def recovery_anchor_prediction(feat: Dict[str, float], fallback_recent: float) -> float:
+    baseline = feat.get("pre_covid_baseline_same_week", np.nan)
+    progress = float(np.clip(feat.get("recovery_progress", 0.0), 0.0, 1.0))
+    recent_candidates = [
+        feat.get("target_ma_4w", np.nan),
+        feat.get("target_lag_1w", np.nan),
+        fallback_recent,
+    ]
+    recent = next((float(v) for v in recent_candidates if pd.notna(v) and np.isfinite(v)), np.nan)
+    if pd.isna(baseline) or not np.isfinite(baseline):
+        return max(recent, 0.0) if np.isfinite(recent) else 0.0
+    if pd.isna(recent) or not np.isfinite(recent):
+        return max(float(baseline), 0.0)
+    return max((1.0 - progress) * recent + progress * float(baseline), 0.0)
+
+
+def lv1_prediction_blend_weights(feat: Dict[str, float]) -> Tuple[float, float, float]:
+    if feat.get("recovery_phase", 0.0) <= 0.0 and feat.get("normalization_phase", 0.0) <= 0.0:
+        model_weight = dynamic_model_weight(feat)
+        return model_weight, 1.0 - model_weight, 0.0
+
+    progress = float(np.clip(feat.get("recovery_progress", 0.0), 0.0, 1.0))
+    recovery_weight = 0.10 + 0.25 * progress
+    model_weight = 0.65 - 0.15 * progress
+    same_iso_weight = 1.0 - model_weight - recovery_weight
+    weights = np.asarray([model_weight, same_iso_weight, recovery_weight], dtype=float)
+    weights = np.clip(weights, 0.0, 1.0)
+    total = float(weights.sum())
+    if total <= EPS:
+        return dynamic_model_weight(feat), 1.0 - dynamic_model_weight(feat), 0.0
+    weights = weights / total
+    return float(weights[0]), float(weights[1]), float(weights[2])
+
+
 def lv1_training_sample_weight(weekly: pd.DataFrame) -> pd.Series:
     week_id = weekly["week_id"].astype(str)
     weight = pd.Series(1.0, index=weekly.index, dtype=float)
@@ -782,13 +856,21 @@ def lv1_training_sample_weight(weekly: pd.DataFrame) -> pd.Series:
 def recovery_weekly_guardrail(pred: float, feat: Dict[str, float]) -> float:
     baseline = feat.get("pre_covid_baseline_same_week", np.nan)
     if (
+        feat.get("normalization_phase", 0.0) > 0
+        and pd.notna(baseline)
+        and np.isfinite(baseline)
+        and baseline > EPS
+        and pred < baseline * 0.85
+    ):
+        return 0.70 * pred + 0.30 * float(baseline)
+    if (
         feat.get("recovery_phase", 0.0) > 0
         and pd.notna(baseline)
         and np.isfinite(baseline)
         and baseline > EPS
         and pred < baseline * 0.85
     ):
-        return 0.90 * pred + 0.10 * float(baseline)
+        return 0.85 * pred + 0.15 * float(baseline)
     return pred
 
 
@@ -801,16 +883,15 @@ def fit_lv1_weekly_model(
     known_mask = training_week_mask(weekly, train_end_week_id, train_start_week_id)
     complete_mask = weekly.get("complete_target_week", True)
     train_mask = known_mask & complete_mask & weekly[target_col].notna()
-    target_values = lv1_target_series(weekly, target_col)
-    smooth_values = smooth_weekly_target(target_values.where(known_mask))
+    train_target_values, feature_values = lv1_training_target_and_feature_values(weekly, target_col, known_mask)
     known_end_pos = train_end_position(weekly, train_end_week_id)
-    features = build_lv1_weekly_feature_frame(weekly, smooth_values, known_end_pos)
-    y = np.log1p(smooth_values)
-    usable = train_mask & smooth_values.notna()
+    features = build_lv1_weekly_feature_frame(weekly, feature_values, known_end_pos)
+    y = np.log1p(train_target_values)
+    usable = train_mask & train_target_values.notna()
     usable = usable & features.notna().sum(axis=1).ge(10)
     sample_weight = lv1_training_sample_weight(weekly).loc[usable]
     model = WeeklyBaseLogModel(alpha=120.0).fit(features.loc[usable], y.loc[usable], sample_weight=sample_weight)
-    return model, smooth_values, features
+    return model, feature_values, features
 
 
 def forecast_weekly_base_recursive(
@@ -823,6 +904,9 @@ def forecast_weekly_base_recursive(
     model, values, _ = fit_lv1_weekly_model(weekly, target_col, train_end_week_id, train_start_week_id)
 
     forecast_set = set(forecast_week_ids)
+    if not forecast_set:
+        return pd.DataFrame()
+    max_forecast_week_id = max(forecast_set)
     predictions = []
     known_end_pos = train_end_position(weekly, train_end_week_id)
     values = values.copy()
@@ -838,7 +922,7 @@ def forecast_weekly_base_recursive(
         week_id = row["week_id"]
         if week_id <= train_end_week_id:
             continue
-        if week_id not in forecast_set:
+        if week_id > max_forecast_week_id:
             continue
 
         values_by_pos, values_by_iso = make_value_maps(weekly, values)
@@ -862,14 +946,21 @@ def forecast_weekly_base_recursive(
             same_iso_growth,
             fallback_median,
         )
-        model_weight = dynamic_model_weight(feat_dict)
-        pred = model_weight * model_pred + (1.0 - model_weight) * same_iso_pred
+        recovery_anchor = recovery_anchor_prediction(feat_dict, same_iso_pred)
+        model_weight, same_iso_weight, recovery_weight = lv1_prediction_blend_weights(feat_dict)
+        pred = (
+            model_weight * model_pred
+            + same_iso_weight * same_iso_pred
+            + recovery_weight * recovery_anchor
+        )
         pred = recovery_weekly_guardrail(pred, feat_dict)
         interval_log = float(np.log1p(pred))
         horizon = len(predictions) + 1
         pred_p10, pred_p90 = model.interval(interval_log, horizon, coverage=0.80)
         pred_p05, pred_p95 = model.interval(interval_log, horizon, coverage=0.90)
         values.iloc[int(pos)] = pred
+        if week_id not in forecast_set:
+            continue
         predictions.append(
             {
                 "week_id": week_id,
@@ -882,6 +973,9 @@ def forecast_weekly_base_recursive(
                 f"{target_col}_lv1_model_pred": model_pred,
                 f"{target_col}_same_iso_pred": same_iso_pred,
                 f"{target_col}_lv1_model_weight": model_weight,
+                f"{target_col}_same_iso_weight": same_iso_weight,
+                f"{target_col}_recovery_weight": recovery_weight,
+                f"{target_col}_recovery_anchor": recovery_anchor,
                 f"{target_col}_lv1_backend": model.backend,
                 f"{target_col}_pre_covid_baseline_same_week": feat_dict.get("pre_covid_baseline_same_week", np.nan),
                 f"{target_col}_covid_adjusted_lag_52w": feat_dict.get("covid_adjusted_lag_52w", np.nan),
@@ -901,10 +995,10 @@ def historical_weekly_base(
 ) -> pd.DataFrame:
     train_mask = training_week_mask(weekly, train_end_week_id, train_start_week_id)
     mask = train_mask & weekly.get("complete_target_week", True) & weekly[target_col].notna()
-    smooth_values = smooth_weekly_target(lv1_target_series(weekly, target_col).where(train_mask))
-    precovid_refs = make_precovid_reference_maps(weekly, smooth_values)
+    train_target_values, feature_values = lv1_training_target_and_feature_values(weekly, target_col, train_mask)
+    precovid_refs = make_precovid_reference_maps(weekly, feature_values)
     out = weekly.loc[mask, ["week_id", "week_start"]].copy()
-    out[f"{target_col}_base"] = smooth_values.loc[mask].clip(lower=0.0).to_numpy()
+    out[f"{target_col}_base"] = train_target_values.loc[mask].clip(lower=0.0).to_numpy()
     out[f"{target_col}_pre_covid_baseline_same_week"] = [
         precovid_refs["baseline_by_week"].get(int(row.iso_week), precovid_refs["fallback_baseline"])
         for row in weekly.loc[mask, ["iso_week"]].itertuples(index=False)

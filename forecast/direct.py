@@ -199,12 +199,21 @@ def blend_direct_daily_forecast(
     out = daily_pred.copy()
     if not len(out):
         return out
-    future = daily[daily["date"].isin(out["date"])].copy()
-    future = out[["date"]].merge(future, on="date", how="left")
+    output_dates = out[["date"]].copy()
+    max_output_date = pd.Timestamp(output_dates["date"].max())
+    future = daily[(daily["date"] > train_end_date) & (daily["date"] <= max_output_date)].copy()
+    if future.empty:
+        future = output_dates.merge(daily, on="date", how="left")
     blend = float(np.clip(blend_weight, 0.0, 1.0))
     for source_col, output_col in [("revenue", "Revenue"), ("cogs", "COGS")]:
         direct_model = fit_direct_daily_model(daily, source_col, train_start_date, train_end_date)
-        direct_pred = predict_direct_daily(future, direct_model)
+        direct_frame = future.copy()
+        direct_frame[f"{output_col}_direct_pred"] = predict_direct_daily(direct_frame, direct_model)
+        direct_pred = output_dates.merge(
+            direct_frame[["date", f"{output_col}_direct_pred"]],
+            on="date",
+            how="left",
+        )[f"{output_col}_direct_pred"].to_numpy(dtype=float)
         base = out[output_col].astype(float).to_numpy()
         direct_pred = np.clip(direct_pred, base * 0.45, base * 1.90)
         blended = (1.0 - blend) * base + blend * direct_pred

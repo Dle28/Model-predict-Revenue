@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 
 from .common import FOLDS
@@ -59,6 +60,83 @@ def _safe_wape(actual: pd.Series, pred: pd.Series) -> float:
     return float(metrics["tmp_wape"])
 
 
+def _add_weekly_drift_metrics(row: Dict[str, float | str], pred: pd.DataFrame) -> None:
+    for prefix in ["revenue_w", "cogs_w"]:
+        pred_col = f"{prefix}_pred"
+        base_col = f"{prefix}_base"
+        if pred_col not in pred.columns or base_col not in pred.columns:
+            continue
+        ratio = (pred[pred_col] / pred[base_col].clip(lower=1e-9)).replace([np.inf, -np.inf], np.nan).dropna()
+        if ratio.empty:
+            continue
+        drift = (ratio - 1.0).abs()
+        row[f"{prefix}_weekly_sum_ratio_median"] = float(ratio.median())
+        row[f"{prefix}_weekly_drift_mean"] = float(drift.mean())
+        row[f"{prefix}_weekly_drift_p90"] = float(drift.quantile(0.90))
+        row[f"{prefix}_weekly_drift_p95"] = float(drift.quantile(0.95))
+        row[f"{prefix}_weekly_drift_max"] = float(drift.max())
+
+
+EVENT_FLOOR_FLAGS = [
+    ("is_holiday", "is_holiday"),
+    ("is_tet_window", "is_tet_window"),
+    ("is_black_friday_window", "is_black_friday_window"),
+    ("is_double_day_sale", "is_double_day_sale"),
+    ("is_1111_1212", "is_1111_1212"),
+    ("is_year_end_window", "is_year_end_window"),
+    ("is_new_year_window", "is_new_year_window"),
+    ("has_promo", "active_promo_count"),
+    ("strong_discount_promo", "avg_promo_discount_value"),
+]
+
+
+def _event_flag_mask(daily_eval: pd.DataFrame, flag_name: str, source_col: str) -> pd.Series:
+    if source_col not in daily_eval.columns:
+        return pd.Series(False, index=daily_eval.index)
+    values = daily_eval[source_col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if flag_name == "strong_discount_promo":
+        active = daily_eval.get("active_promo_count", pd.Series(0.0, index=daily_eval.index)).fillna(0.0).gt(0)
+        return active & values.ge(15.0)
+    return values.gt(0)
+
+
+def _event_floor_validation_rows(fold: str, daily_eval: pd.DataFrame) -> List[Dict[str, float | str]]:
+    rows: List[Dict[str, float | str]] = []
+    if daily_eval.empty:
+        return rows
+    for target, actual_col in [("Revenue", "revenue"), ("COGS", "cogs")]:
+        base_col = f"{target}_lv2_base"
+        before_col = f"{target}_before_floor"
+        after_col = f"{target}_after_floor"
+        raw_mult_col = f"{target}_lv3_raw_multiplier"
+        pred_mult_col = f"{target}_lv3_multiplier"
+        if not {actual_col, base_col, before_col, after_col, raw_mult_col, pred_mult_col}.issubset(daily_eval.columns):
+            continue
+        for flag_name, source_col in EVENT_FLOOR_FLAGS:
+            mask = _event_flag_mask(daily_eval, flag_name, source_col)
+            if not mask.any():
+                continue
+            base = daily_eval.loc[mask, base_col].clip(lower=1e-9)
+            actual_multiplier = daily_eval.loc[mask, actual_col] / base
+            rows.append(
+                {
+                    "fold": fold,
+                    "target": target,
+                    "event_flag": flag_name,
+                    "count": int(mask.sum()),
+                    "floor_applied_rate": float(daily_eval.loc[mask, f"{target}_event_floor_applied"].mean())
+                    if f"{target}_event_floor_applied" in daily_eval.columns
+                    else np.nan,
+                    "actual_multiplier_median": float(actual_multiplier.replace([np.inf, -np.inf], np.nan).median()),
+                    "raw_pred_multiplier_median": float(daily_eval.loc[mask, raw_mult_col].median()),
+                    "pred_multiplier_median": float(daily_eval.loc[mask, pred_mult_col].median()),
+                    "WAPE_before_floor": _safe_wape(daily_eval.loc[mask, actual_col], daily_eval.loc[mask, before_col]),
+                    "WAPE_after_floor": _safe_wape(daily_eval.loc[mask, actual_col], daily_eval.loc[mask, after_col]),
+                }
+            )
+    return rows
+
+
 def _add_daily_slices(row: Dict[str, float | str], daily_eval: pd.DataFrame) -> None:
     if daily_eval.empty:
         return
@@ -89,8 +167,13 @@ def _add_daily_slices(row: Dict[str, float | str], daily_eval: pd.DataFrame) -> 
         )
 
 
-def run_backtests(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
+def run_backtests(
+    daily: pd.DataFrame,
+    weekly: pd.DataFrame,
+    include_event_floor_table: bool = False,
+) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    event_rows: List[Dict[str, float | str]] = []
     for tr_start, tr_end, va_start, va_end in FOLDS:
         train_mask = weekly["week_id"].between(tr_start, tr_end) & weekly["complete_target_week"]
         val_mask = weekly["week_id"].between(va_start, va_end) & weekly["complete_target_week"]
@@ -125,6 +208,7 @@ def run_backtests(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
         row.update(metric_frame(pred["cogs_w"], pred["cogs_w_base"], "weekly_base_cogs"))
         row.update(metric_frame(pred["revenue_w"], pred["revenue_w_pred"], "weekly_revenue"))
         row.update(metric_frame(pred["cogs_w"], pred["cogs_w_pred"], "weekly_cogs"))
+        _add_weekly_drift_metrics(row, pred)
 
         for target, actual_col in [("revenue_w", "revenue_w"), ("cogs_w", "cogs_w")]:
             base_col = f"{target}_base"
@@ -132,20 +216,43 @@ def run_backtests(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
                 row[f"{target}_avg_lv3_weekly_uplift"] = float((pred[f"{target}_pred"] / pred[base_col].clip(lower=1e-9) - 1.0).mean())
 
         val_daily_all = daily[daily["week_id"].isin(val_week_ids) & daily["revenue"].notna()].copy()
-        daily_eval = val_daily_all[["date", "revenue", "cogs"]].merge(
-            daily_pred[
-                [
-                    "date",
-                    "Revenue",
-                    "COGS",
-                    "Revenue_lv3_multiplier",
-                    "COGS_lv3_multiplier",
-                    "Revenue_p10",
-                    "Revenue_p90",
-                    "COGS_p10",
-                    "COGS_p90",
-                ]
-            ],
+        event_cols = [
+            "date",
+            "revenue",
+            "cogs",
+            "is_holiday",
+            "is_tet_window",
+            "is_black_friday_window",
+            "is_double_day_sale",
+            "is_1111_1212",
+            "is_year_end_window",
+            "is_new_year_window",
+            "active_promo_count",
+            "avg_promo_discount_value",
+        ]
+        pred_cols = [
+            "date",
+            "Revenue",
+            "COGS",
+            "Revenue_lv2_base",
+            "COGS_lv2_base",
+            "Revenue_lv3_multiplier",
+            "COGS_lv3_multiplier",
+            "Revenue_lv3_raw_multiplier",
+            "COGS_lv3_raw_multiplier",
+            "Revenue_event_floor_applied",
+            "COGS_event_floor_applied",
+            "Revenue_before_floor",
+            "COGS_before_floor",
+            "Revenue_after_floor",
+            "COGS_after_floor",
+            "Revenue_p10",
+            "Revenue_p90",
+            "COGS_p10",
+            "COGS_p90",
+        ]
+        daily_eval = val_daily_all[[c for c in event_cols if c in val_daily_all.columns]].merge(
+            daily_pred[[c for c in pred_cols if c in daily_pred.columns]],
             on="date",
             how="inner",
         )
@@ -154,5 +261,9 @@ def run_backtests(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
         row["revenue_lv3_multiplier_max"] = float(daily_eval["Revenue_lv3_multiplier"].max())
         row["cogs_lv3_multiplier_max"] = float(daily_eval["COGS_lv3_multiplier"].max())
         _add_daily_slices(row, daily_eval)
+        event_rows.extend(_event_floor_validation_rows(f"{va_start}_{va_end}", daily_eval))
         rows.append(row)
-    return pd.DataFrame(rows)
+    metrics = pd.DataFrame(rows)
+    if include_event_floor_table:
+        return metrics, pd.DataFrame(event_rows)
+    return metrics
