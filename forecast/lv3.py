@@ -1,54 +1,178 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-from .common import EPS, covid_regime_flags, safe_div
+from .common import EPS, covid_regime_flag_frame, safe_div
 from .lv1 import RidgeLogModel
 
 
-LV3_MULTIPLIER_MIN = 0.25
+LV3_MULTIPLIER_MIN = 0.05
 LV3_MULTIPLIER_MAX = 4.00
 LV3_INTERVAL_SCALE = 1.40
-
-SPIKE_ACTIVITY_COLUMNS = [
-    "sessions",
-    "unique_visitors",
-    "page_views",
-    "source_entropy",
-    "orders_count",
-    "orders_per_session",
-    "new_customers",
+LV3_INTERVAL_HORIZON_DAILY_SLOPE = 0.015
+LV3_INTERVAL_VALIDATION_DAYS = 91
+TARGET_HISTORY_LAGS = [7, 14, 28]
+TARGET_HISTORY_WINDOWS = [7, 28]
+LV3_STRONG_EVENT_COLUMNS = [
+    "is_1111_1212",
+    "is_tet_window",
+    "is_black_friday_window",
+    "is_double_day_sale",
+]
+LV3_EVENT_FLOOR_QUANTILE = 0.40
+LV3_EVENT_FLOOR_MIN_SAMPLES = 2
+LV3_EVENT_BASE_MODES = {"lv2", "weekly_avg"}
+DEFAULT_LV3_EVENT_BASE_MODE = "lv2"
+PLANNED_PROMO_COLUMNS = {
     "active_promo_count",
+    "promo_flag",
     "avg_promo_discount_value",
     "stackable_promo_count",
-    "discount_rate",
-    "promo_intensity",
-    "return_rate",
-    "refund_rate",
-    "stockout_rate",
-    "review_count",
-    "avg_rating",
-    "low_rating_share",
+}
+
+SPIKE_ACTIVITY_COLUMNS = [
+    "active_promo_count",
+    "promo_flag",
+    "avg_promo_discount_value",
+    "stackable_promo_count",
     "revenue_lag_7d",
     "revenue_lag_14d",
     "revenue_lag_28d",
     "revenue_ma_7d",
     "revenue_ma_28d",
+    "revenue_shock_7d",
     "cogs_lag_7d",
     "cogs_lag_14d",
     "cogs_lag_28d",
     "cogs_ma_7d",
     "cogs_ma_28d",
+    "cogs_shock_7d",
 ]
+
+FUTURE_TARGET_HISTORY_COLUMNS = {
+    "revenue_lag_7d",
+    "revenue_lag_14d",
+    "revenue_lag_28d",
+    "revenue_ma_7d",
+    "revenue_ma_28d",
+    "revenue_shock_7d",
+    "cogs_lag_7d",
+    "cogs_lag_14d",
+    "cogs_lag_28d",
+    "cogs_ma_7d",
+    "cogs_ma_28d",
+    "cogs_shock_7d",
+}
+
+LV3_MONOTONE_CONSTRAINTS = {
+    "active_promo_count": 1,
+    "log1p_active_promo_count": 1,
+    "avg_promo_discount_value": 1,
+    "log1p_avg_promo_discount_value": 1,
+    "stackable_promo_count": 1,
+    "log1p_stackable_promo_count": 1,
+}
+LV3_MODEL_BACKEND_ALIASES = {
+    "lgb": "lightgbm",
+    "lgbm": "lightgbm",
+    "xgb": "xgboost",
+}
+LV3_MODEL_BACKENDS = {"ridge", "lightgbm", "xgboost", "auto"}
+DEFAULT_LV3_MODEL_BACKEND = "xgboost"
 
 
 def _numeric_feature(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if col in df.columns:
         return df[col].replace([np.inf, -np.inf], np.nan).fillna(default).astype(float)
     return pd.Series(default, index=df.index, dtype=float)
+
+
+def lv3_monotone_constraints(features: list[str]) -> list[int]:
+    return [LV3_MONOTONE_CONSTRAINTS.get(col, 0) for col in features]
+
+
+def requested_lv3_model_backend() -> str:
+    raw = os.environ.get("FORECAST_LV3_MODEL_BACKEND", os.environ.get("FORECAST_MODEL_BACKEND", DEFAULT_LV3_MODEL_BACKEND))
+    backend = raw.strip().lower()
+    backend = LV3_MODEL_BACKEND_ALIASES.get(backend, backend)
+    return backend if backend in LV3_MODEL_BACKENDS else DEFAULT_LV3_MODEL_BACKEND
+
+
+def requested_lv3_event_base_mode() -> str:
+    mode = os.environ.get("FORECAST_LV3_EVENT_BASE_MODE", DEFAULT_LV3_EVENT_BASE_MODE).strip().lower()
+    return mode if mode in LV3_EVENT_BASE_MODES else DEFAULT_LV3_EVENT_BASE_MODE
+
+
+def requested_lv3_event_floor_enabled() -> bool:
+    raw = os.environ.get("FORECAST_LV3_EVENT_FLOOR", "").strip().lower()
+    return raw in {"on", "1", "true", "yes"}
+
+
+def fit_lv3_xgboost_regressor(X: pd.DataFrame, y: pd.Series) -> tuple[Any, str]:
+    import xgboost as xgb  # type: ignore
+
+    constraints = tuple(lv3_monotone_constraints(list(X.columns)))
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        learning_rate=0.035,
+        n_estimators=220,
+        max_depth=3,
+        min_child_weight=20,
+        subsample=0.85,
+        colsample_bytree=0.75,
+        reg_alpha=0.05,
+        reg_lambda=4.0,
+        monotone_constraints=constraints,
+        random_state=42,
+        n_jobs=0,
+    )
+    model.fit(X, y)
+    return model, "xgboost_monotone"
+
+
+def fit_lv3_lightgbm_regressor(X: pd.DataFrame, y: pd.Series) -> tuple[Any, str]:
+    import lightgbm as lgb  # type: ignore
+
+    model = lgb.LGBMRegressor(
+        objective="regression",
+        learning_rate=0.035,
+        n_estimators=160,
+        num_leaves=11,
+        min_child_samples=45,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.75,
+        reg_alpha=0.05,
+        reg_lambda=4.0,
+        monotone_constraints=lv3_monotone_constraints(list(X.columns)),
+        monotone_constraints_method="intermediate",
+        random_state=42,
+        verbose=-1,
+    )
+    model.fit(X, y)
+    return model, "lightgbm_monotone"
+
+
+def fit_lv3_log_regressor(X: pd.DataFrame, y: pd.Series, alpha: float = 100.0) -> tuple[Any, str]:
+    if len(X) < 50:
+        return RidgeLogModel(alpha=alpha).fit(X, y), "ridge"
+    requested_backend = requested_lv3_model_backend()
+    if requested_backend in {"xgboost", "auto"}:
+        try:
+            return fit_lv3_xgboost_regressor(X, y)
+        except Exception:
+            if requested_backend == "xgboost":
+                return RidgeLogModel(alpha=alpha).fit(X, y), "ridge"
+    try:
+        if requested_backend in {"lightgbm", "auto"}:
+            return fit_lv3_lightgbm_regressor(X, y)
+    except Exception:
+        pass
+    return RidgeLogModel(alpha=alpha).fit(X, y), "ridge"
 
 
 def spike_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,21 +190,21 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
         day_of_year = date.dt.dayofyear.astype(float)
 
     lv2_base = _numeric_feature(df, "lv2_base_value")
+    multiplier_base = _numeric_feature(df, "lv3_multiplier_base_value")
+    multiplier_base = multiplier_base.where(multiplier_base.gt(EPS), lv2_base)
     features: Dict[str, Any] = {
         "bias": 1.0,
         "log_lv2_base": np.log1p(lv2_base),
+        "log_lv3_multiplier_base": np.log1p(multiplier_base),
     }
     if "week_id" in df.columns:
         week_start = pd.to_datetime(df["week_start"]) if "week_start" in df.columns else date
-        flags = [covid_regime_flags(str(wid), wstart) for wid, wstart in zip(df["week_id"].astype(str), week_start)]
-        flag_frame = pd.DataFrame(flags, index=df.index)
+        flag_frame = covid_regime_flag_frame(df["week_id"].astype(str), week_start)
         for col in [
             "pre_covid",
             "covid_drop",
             "recovery_phase",
             "normalization_phase",
-            "weeks_since_covid_start",
-            "weeks_since_recovery_start",
             "recovery_progress",
         ]:
             features[col] = flag_frame[col].astype(float)
@@ -90,8 +214,6 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
             "covid_drop",
             "recovery_phase",
             "normalization_phase",
-            "weeks_since_covid_start",
-            "weeks_since_recovery_start",
             "recovery_progress",
         ]:
             features[col] = 0.0
@@ -119,6 +241,8 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
     recovery_gap = (1.0 - base_vs_precovid_baseline).clip(lower=-0.5, upper=0.7)
     features["base_vs_precovid_baseline"] = base_vs_precovid_baseline
     features["recovery_gap"] = recovery_gap
+    features["lv3_multiplier_base_ratio"] = safe_div(multiplier_base, lv2_base).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.0, 5.0)
+    features["lv3_uses_weekly_avg_event_base"] = _numeric_feature(df, "lv3_uses_weekly_avg_event_base")
     for weekday in range(1, 8):
         features[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
     for month_id in range(1, 13):
@@ -170,7 +294,6 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
         raw = _numeric_feature(df, col)
         features[col] = raw
         features[f"log1p_{col}"] = np.log1p(raw.clip(lower=0.0))
-    features["orders_per_session_safe"] = safe_div(_numeric_feature(df, "orders_count"), _numeric_feature(df, "sessions"))
     revenue_lag7 = _numeric_feature(df, "revenue_lag_7d")
     cogs_lag7 = _numeric_feature(df, "cogs_lag_7d")
     target_lag7 = revenue_lag7.where(revenue_lag7.gt(0), cogs_lag7)
@@ -184,32 +307,8 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
         + is_payday_window
         + _numeric_feature(df, "active_promo_count").clip(lower=0.0, upper=3.0)
     )
-    recovery_progress = features["recovery_progress"]
     features["event_intensity"] = event_intensity
-    features["event_intensity_x_recovery_progress"] = event_intensity * recovery_progress
-    features["recovery_gap_x_recovery_progress"] = recovery_gap * recovery_progress
     return pd.DataFrame(features, index=df.index).copy()
-
-
-def fit_spike_classifier(X: pd.DataFrame, y: pd.Series) -> Any:
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import StandardScaler
-
-        model = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                C=0.75,
-                class_weight="balanced",
-                max_iter=1000,
-                random_state=42,
-            ),
-        )
-        model.fit(X, y.astype(int))
-        return model
-    except Exception:
-        return RidgeLogModel(alpha=350.0).fit(X, y.astype(float))
 
 
 class SpikeMultiplierModel:
@@ -224,56 +323,25 @@ class SpikeMultiplierModel:
         self.alpha = alpha
         self.min_multiplier = min_multiplier
         self.max_multiplier = max_multiplier
-        self.model: Optional[RidgeLogModel] = None
-        self.up_classifier: Optional[Any] = None
-        self.down_classifier: Optional[Any] = None
-        self.up_model: Optional[RidgeLogModel] = None
-        self.down_model: Optional[RidgeLogModel] = None
-        self.normal_model: Optional[RidgeLogModel] = None
+        self.model: Optional[Any] = None
+        self.backend = "ridge"
         self.fallback_log_multiplier = 0.0
-        self.fallback_up_log_multiplier = np.log(1.45)
-        self.fallback_down_log_multiplier = np.log(0.70)
         self.abs_log_residual_q80 = 0.18
         self.abs_log_residual_q90 = 0.28
         self.train_end_date: Optional[pd.Timestamp] = None
         self.activity_fill_values: Dict[str, float] = {}
-        self.up_threshold = 1.35
-        self.down_threshold = 0.70
+        self.history_values: Dict[pd.Timestamp, float] = {}
+        self.event_floor_multipliers: Dict[str, float] = {}
 
     def fit(self, X: pd.DataFrame, multiplier: pd.Series) -> "SpikeMultiplierModel":
         y = np.log(multiplier.clip(lower=self.min_multiplier, upper=self.max_multiplier))
         finite = y.replace([np.inf, -np.inf], np.nan).notna()
         X = X.loc[finite].copy()
         y = y.loc[finite]
-        clean_multiplier = multiplier.loc[finite].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(
-            lower=self.min_multiplier,
-            upper=self.max_multiplier,
-        )
         if len(y):
             self.fallback_log_multiplier = float(np.median(y))
-            self.up_threshold = float(max(1.25, np.nanquantile(clean_multiplier, 0.85)))
-            self.down_threshold = float(min(0.80, np.nanquantile(clean_multiplier, 0.15)))
-            up_vals = y.loc[clean_multiplier.ge(self.up_threshold)]
-            down_vals = y.loc[clean_multiplier.le(self.down_threshold)]
-            if len(up_vals):
-                self.fallback_up_log_multiplier = float(np.median(up_vals))
-            if len(down_vals):
-                self.fallback_down_log_multiplier = float(np.median(down_vals))
         if len(y) >= 20:
-            self.model = RidgeLogModel(alpha=self.alpha).fit(X, y)
-            up_label = clean_multiplier.ge(self.up_threshold).astype(float)
-            down_label = clean_multiplier.le(self.down_threshold).astype(float)
-            if up_label.sum() >= 10 and up_label.sum() < len(up_label):
-                self.up_classifier = fit_spike_classifier(X, up_label)
-            if down_label.sum() >= 10 and down_label.sum() < len(down_label):
-                self.down_classifier = fit_spike_classifier(X, down_label)
-            normal_mask = ~(up_label.astype(bool) | down_label.astype(bool))
-            if normal_mask.sum() >= 20:
-                self.normal_model = RidgeLogModel(alpha=150.0).fit(X.loc[normal_mask], y.loc[normal_mask])
-            if up_label.sum() >= 20:
-                self.up_model = RidgeLogModel(alpha=180.0).fit(X.loc[up_label.astype(bool)], y.loc[up_label.astype(bool)])
-            if down_label.sum() >= 20:
-                self.down_model = RidgeLogModel(alpha=180.0).fit(X.loc[down_label.astype(bool)], y.loc[down_label.astype(bool)])
+            self.model, self.backend = fit_lv3_log_regressor(X, y, alpha=self.alpha)
             pred = self.model.predict(X)
             residual = y.to_numpy() - pred
             residual = residual[np.isfinite(residual)]
@@ -282,57 +350,65 @@ class SpikeMultiplierModel:
                 self.abs_log_residual_q90 = float(np.quantile(np.abs(residual), 0.90))
         return self
 
-    def _predict_log(self, model: Optional[RidgeLogModel], X: pd.DataFrame, fallback: float) -> np.ndarray:
-        if model is None:
-            return np.full(len(X), fallback, dtype=float)
-        return np.asarray(model.predict(X), dtype=float)
-
-    def _predict_probability(self, model: Optional[Any], X: pd.DataFrame) -> np.ndarray:
-        if model is None:
-            return np.zeros(len(X), dtype=float)
-        if hasattr(model, "predict_proba"):
-            proba = np.asarray(model.predict_proba(X), dtype=float)
-            if proba.ndim == 2 and proba.shape[1] >= 2:
-                return proba[:, 1].clip(0.0, 0.55)
-        return np.asarray(model.predict(X), dtype=float).clip(0.0, 0.45)
+    def set_interval_residuals(self, residual: pd.Series | np.ndarray) -> None:
+        residual_values = np.asarray(residual, dtype=float)
+        residual_values = residual_values[np.isfinite(residual_values)]
+        if len(residual_values):
+            self.abs_log_residual_q80 = float(np.quantile(np.abs(residual_values), 0.80))
+            self.abs_log_residual_q90 = float(np.quantile(np.abs(residual_values), 0.90))
 
     def predict_multiplier(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:
             pred_log = np.full(len(X), self.fallback_log_multiplier, dtype=float)
         else:
             pred_log = np.asarray(self.model.predict(X), dtype=float)
-        base = np.exp(pred_log).clip(self.min_multiplier, self.max_multiplier)
-        p_up = self._predict_probability(self.up_classifier, X)
-        p_down = self._predict_probability(self.down_classifier, X)
-        total_p = p_up + p_down
-        too_high = total_p > 0.55
-        p_up = np.where(too_high, p_up / np.maximum(total_p, EPS) * 0.55, p_up)
-        p_down = np.where(too_high, p_down / np.maximum(total_p, EPS) * 0.55, p_down)
+        return np.exp(pred_log).clip(self.min_multiplier, self.max_multiplier)
 
-        up = np.exp(self._predict_log(self.up_model, X, self.fallback_up_log_multiplier)).clip(
-            self.up_threshold,
-            self.max_multiplier,
-        )
-        down = np.exp(self._predict_log(self.down_model, X, self.fallback_down_log_multiplier)).clip(
-            self.min_multiplier,
-            self.down_threshold,
-        )
-        normal = np.exp(self._predict_log(self.normal_model, X, self.fallback_log_multiplier)).clip(
-            self.min_multiplier,
-            self.max_multiplier,
-        )
-        hybrid = p_up * up + p_down * down + np.maximum(1.0 - p_up - p_down, 0.0) * normal
-        return (0.70 * base + 0.30 * hybrid).clip(self.min_multiplier, self.max_multiplier)
-
-    def interval_multiplier(self, X: pd.DataFrame, coverage: float = 0.80) -> tuple[np.ndarray, np.ndarray]:
+    def interval_multiplier(
+        self,
+        X: pd.DataFrame,
+        coverage: float = 0.80,
+        dates: Optional[pd.Series] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.model is None:
             pred_log = np.full(len(X), self.fallback_log_multiplier, dtype=float)
         else:
             pred_log = np.asarray(self.model.predict(X), dtype=float)
         q = (self.abs_log_residual_q80 if coverage <= 0.80 else self.abs_log_residual_q90) * LV3_INTERVAL_SCALE
+        if dates is not None and self.train_end_date is not None:
+            date_values = pd.Series(pd.to_datetime(dates))
+            days_ahead = (date_values - self.train_end_date).dt.days.clip(lower=0).to_numpy(dtype=float)
+            q = q * (1.0 + LV3_INTERVAL_HORIZON_DAILY_SLOPE * days_ahead)
         lo = np.exp(pred_log - q).clip(self.min_multiplier, self.max_multiplier)
         hi = np.exp(pred_log + q).clip(self.min_multiplier, self.max_multiplier)
         return lo, hi
+
+
+def calibrate_lv3_interval_from_holdout(
+    model: SpikeMultiplierModel,
+    train: pd.DataFrame,
+    multiplier: pd.Series,
+) -> None:
+    if len(train) < 120:
+        return
+    dates = pd.to_datetime(train["date"])
+    val_start = dates.max() - pd.Timedelta(days=LV3_INTERVAL_VALIDATION_DAYS - 1)
+    y_log = np.log(multiplier.clip(lower=model.min_multiplier, upper=model.max_multiplier))
+    finite = y_log.replace([np.inf, -np.inf], np.nan).notna()
+    train_mask = dates.lt(val_start) & finite
+    val_mask = dates.ge(val_start) & finite
+    if train_mask.sum() < 50 or val_mask.sum() < 14:
+        return
+    try:
+        holdout_model, _ = fit_lv3_log_regressor(
+            spike_features(train.loc[train_mask]),
+            y_log.loc[train_mask],
+            alpha=model.alpha,
+        )
+        pred_log = np.asarray(holdout_model.predict(spike_features(train.loc[val_mask])), dtype=float)
+        model.set_interval_residuals(y_log.loc[val_mask].to_numpy() - pred_log)
+    except Exception:
+        return
 
 
 def _prepare_base_join(
@@ -349,10 +425,66 @@ def _prepare_base_join(
     return out
 
 
+def _strong_event_mask(df: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(False, index=df.index)
+    for col in LV3_STRONG_EVENT_COLUMNS:
+        if col in df.columns:
+            mask = mask | _numeric_feature(df, col).gt(0.0)
+    return mask
+
+
+def _attach_multiplier_base(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    lv2_base = _numeric_feature(out, "lv2_base_value")
+    weekly_base = _numeric_feature(out, "weekly_base_value")
+    weekly_avg_base = (weekly_base / 7.0).where(weekly_base.gt(EPS), lv2_base)
+    strong_event = (
+        _strong_event_mask(out)
+        if requested_lv3_event_base_mode() == "weekly_avg"
+        else pd.Series(False, index=out.index)
+    )
+    multiplier_base = lv2_base.where(~strong_event, weekly_avg_base)
+    out["lv3_multiplier_base_value"] = multiplier_base.clip(lower=EPS)
+    out["lv3_uses_weekly_avg_event_base"] = strong_event.astype(float)
+    return out
+
+
+def _event_floor_multipliers(train: pd.DataFrame, multiplier: pd.Series) -> Dict[str, float]:
+    if not requested_lv3_event_floor_enabled():
+        return {}
+    floors: Dict[str, float] = {}
+    clean_multiplier = multiplier.replace([np.inf, -np.inf], np.nan).astype(float)
+    for col in LV3_STRONG_EVENT_COLUMNS:
+        if col not in train.columns:
+            continue
+        mask = _numeric_feature(train, col).gt(0.0) & clean_multiplier.notna()
+        if int(mask.sum()) < LV3_EVENT_FLOOR_MIN_SAMPLES:
+            continue
+        floor = float(clean_multiplier.loc[mask].quantile(LV3_EVENT_FLOOR_QUANTILE))
+        if np.isfinite(floor) and floor > EPS:
+            floors[col] = float(np.clip(floor, LV3_MULTIPLIER_MIN, LV3_MULTIPLIER_MAX))
+    return floors
+
+
+def _event_floor_for_row(row: pd.Series, model: SpikeMultiplierModel) -> float:
+    floor = 0.0
+    for col, value in model.event_floor_multipliers.items():
+        if float(row.get(col, 0.0) or 0.0) > 0.0:
+            floor = max(floor, value)
+    return floor
+
+
 def _activity_fill_values(train: pd.DataFrame) -> Dict[str, float]:
     values: Dict[str, float] = {}
+    zero_fill_cols = PLANNED_PROMO_COLUMNS | {
+        "revenue_shock_7d",
+        "cogs_shock_7d",
+    }
     for col in SPIKE_ACTIVITY_COLUMNS:
         if col not in train.columns:
+            continue
+        if col in zero_fill_cols:
+            values[col] = 0.0
             continue
         series = train[col].replace([np.inf, -np.inf], np.nan)
         positive = series[series > 0]
@@ -360,21 +492,85 @@ def _activity_fill_values(train: pd.DataFrame) -> Dict[str, float]:
     return values
 
 
+def _target_history_columns(target_col: str) -> set[str]:
+    columns = {f"{target_col}_lag_{lag}d" for lag in TARGET_HISTORY_LAGS}
+    columns.update(f"{target_col}_ma_{window}d" for window in TARGET_HISTORY_WINDOWS)
+    columns.add(f"{target_col}_shock_7d")
+    return columns
+
+
+def _history_map(daily: pd.DataFrame, target_col: str, end_date: pd.Timestamp) -> Dict[pd.Timestamp, float]:
+    hist = daily[(daily["date"] <= end_date) & daily[target_col].notna()][["date", target_col]].copy()
+    return {
+        pd.Timestamp(row.date).normalize(): float(getattr(row, target_col))
+        for row in hist.itertuples(index=False)
+    }
+
+
+def _target_history_features_for_date(
+    date: pd.Timestamp,
+    values_by_date: Dict[pd.Timestamp, float],
+    target_col: str,
+    fallback_values: Dict[str, float],
+) -> Dict[str, float]:
+    key = pd.Timestamp(date).normalize()
+    features: Dict[str, float] = {}
+    for lag in TARGET_HISTORY_LAGS:
+        col = f"{target_col}_lag_{lag}d"
+        features[col] = values_by_date.get(key - pd.Timedelta(days=lag), fallback_values.get(col, np.nan))
+    for window in TARGET_HISTORY_WINDOWS:
+        col = f"{target_col}_ma_{window}d"
+        vals = [
+            values_by_date.get(key - pd.Timedelta(days=offset), np.nan)
+            for offset in range(1, window + 1)
+        ]
+        arr = np.asarray(vals, dtype=float)
+        features[col] = float(np.nanmean(arr)) if np.isfinite(arr).any() else fallback_values.get(col, np.nan)
+    lag1 = values_by_date.get(key - pd.Timedelta(days=1), np.nan)
+    ma7 = features[f"{target_col}_ma_7d"]
+    shock_col = f"{target_col}_shock_7d"
+    if np.isfinite(lag1) and np.isfinite(ma7) and ma7 > EPS:
+        features[shock_col] = float(np.clip(abs(lag1 - ma7) / ma7, 0.0, 5.0))
+    else:
+        features[shock_col] = fallback_values.get(shock_col, 0.0)
+    return features
+
+
+def _attach_autoregressive_target_history(
+    df: pd.DataFrame,
+    values_by_date: Dict[pd.Timestamp, float],
+    target_col: str,
+    fallback_values: Dict[str, float],
+) -> pd.DataFrame:
+    out = df.copy()
+    rows = [
+        _target_history_features_for_date(dt, values_by_date, target_col, fallback_values)
+        for dt in pd.to_datetime(out["date"])
+    ]
+    hist = pd.DataFrame(rows, index=out.index)
+    for col in hist.columns:
+        out[col] = hist[col]
+    return out
+
+
 def _fill_unknown_future_activity(df: pd.DataFrame, model: SpikeMultiplierModel) -> pd.DataFrame:
     if model.train_end_date is None:
         return df
     out = df.copy()
     future_mask = pd.to_datetime(out["date"]).gt(model.train_end_date)
+    target_history_cols = _target_history_columns(model.target_col)
     for col, fill_value in model.activity_fill_values.items():
         if col not in out.columns:
+            continue
+        if col in target_history_cols:
+            continue
+        if col in PLANNED_PROMO_COLUMNS:
+            missing_future = future_mask & out[col].replace([np.inf, -np.inf], np.nan).isna()
+            out.loc[missing_future, col] = 0.0
             continue
         missing_like = future_mask & out[col].replace([np.inf, -np.inf], np.nan).fillna(0.0).le(0.0)
         out.loc[missing_like, col] = fill_value
     return out
-
-
-def tactical_event_floor(df: pd.DataFrame, target_output_col: str) -> np.ndarray:
-    return np.full(len(df), LV3_MULTIPLIER_MIN, dtype=float)
 
 
 def fit_spike_multiplier_model(
@@ -389,13 +585,17 @@ def fit_spike_multiplier_model(
     if train_start_date is not None:
         train = train[train["date"] >= train_start_date].copy()
     train = _prepare_base_join(train, base_daily, base_col)
-    train = train[train["lv2_base_value"].notna() & train["lv2_base_value"].gt(EPS)].copy()
-    multiplier = train[target_col] / train["lv2_base_value"]
+    train = _attach_multiplier_base(train)
+    train = train[train["lv3_multiplier_base_value"].notna() & train["lv3_multiplier_base_value"].gt(EPS)].copy()
+    multiplier = train[target_col] / train["lv3_multiplier_base_value"]
 
     model = SpikeMultiplierModel(target_col=target_col)
     model.train_end_date = pd.Timestamp(train_end_date)
     model.activity_fill_values = _activity_fill_values(train)
+    model.history_values = _history_map(daily, target_col, pd.Timestamp(train_end_date))
+    model.event_floor_multipliers = _event_floor_multipliers(train, multiplier)
     model.fit(spike_features(train), multiplier)
+    calibrate_lv3_interval_from_holdout(model, train, multiplier)
     return model
 
 
@@ -407,34 +607,67 @@ def apply_spike_multiplier(
     model: SpikeMultiplierModel,
 ) -> pd.DataFrame:
     raw_pred = _prepare_base_join(future_daily, base_daily, base_col)
-    pred = _fill_unknown_future_activity(raw_pred, model)
-    features = spike_features(pred)
-    raw_multiplier = model.predict_multiplier(features)
-    floor_multiplier = tactical_event_floor(raw_pred, target_output_col)
-    multiplier = np.maximum(raw_multiplier, floor_multiplier).clip(
-        model.min_multiplier,
-        model.max_multiplier,
-    )
-    lo80, hi80 = model.interval_multiplier(features, coverage=0.80)
-    lo90, hi90 = model.interval_multiplier(features, coverage=0.90)
-    hi80 = np.maximum(hi80, multiplier)
-    hi90 = np.maximum(hi90, multiplier)
-
-    out = pred[["date", "week_id", "week_start", "lv2_base_value"]].copy()
-    out[f"{target_output_col}_lv2_base"] = out["lv2_base_value"].clip(lower=0.0)
-    out[f"{target_output_col}_lv3_raw_multiplier"] = raw_multiplier
-    out[f"{target_output_col}_event_floor_multiplier"] = floor_multiplier
-    out[f"{target_output_col}_event_floor_applied"] = (floor_multiplier > (raw_multiplier + 1e-9)).astype(float)
-    out[f"{target_output_col}_before_floor"] = out[f"{target_output_col}_lv2_base"] * raw_multiplier
-    out[f"{target_output_col}_after_floor"] = out[f"{target_output_col}_lv2_base"] * multiplier
-    out[f"{target_output_col}_lv3_multiplier"] = multiplier
-    out[target_output_col] = out[f"{target_output_col}_lv2_base"] * out[f"{target_output_col}_lv3_multiplier"]
-    out[f"{target_output_col}_p10"] = out[f"{target_output_col}_lv2_base"] * lo80
-    out[f"{target_output_col}_p90"] = out[f"{target_output_col}_lv2_base"] * hi80
-    out[f"{target_output_col}_p05"] = out[f"{target_output_col}_lv2_base"] * lo90
-    out[f"{target_output_col}_p95"] = out[f"{target_output_col}_lv2_base"] * hi90
-    out = out.drop(columns=["lv2_base_value"])
+    raw_pred = _attach_multiplier_base(raw_pred)
+    pred = _fill_unknown_future_activity(raw_pred, model).sort_values("date").copy()
+    values_by_date = dict(model.history_values)
+    rows = []
+    for _, row in pred.iterrows():
+        one = pd.DataFrame([row])
+        one = _attach_autoregressive_target_history(
+            one,
+            values_by_date,
+            model.target_col,
+            model.activity_fill_values,
+        )
+        features = spike_features(one)
+        model_multiplier = float(model.predict_multiplier(features)[0])
+        multiplier_cap = model.max_multiplier
+        raw_multiplier = model_multiplier
+        floor_multiplier = _event_floor_for_row(row, model)
+        multiplier = float(np.clip(max(raw_multiplier, floor_multiplier), model.min_multiplier, model.max_multiplier))
+        lo80, hi80 = model.interval_multiplier(features, coverage=0.80, dates=one["date"])
+        lo90, hi90 = model.interval_multiplier(features, coverage=0.90, dates=one["date"])
+        lo80_value = min(float(lo80[0]), multiplier_cap)
+        lo90_value = min(float(lo90[0]), multiplier_cap)
+        hi80_value = min(max(float(hi80[0]), multiplier), multiplier_cap)
+        hi90_value = min(max(float(hi90[0]), multiplier), multiplier_cap)
+        lv2_base = max(float(row["lv2_base_value"]), 0.0)
+        multiplier_base = max(float(row.get("lv3_multiplier_base_value", lv2_base)), 0.0)
+        pred_value = multiplier_base * multiplier
+        values_by_date[pd.Timestamp(row["date"]).normalize()] = pred_value
+        rows.append(
+            {
+                "date": row["date"],
+                "week_id": row["week_id"],
+                "week_start": row["week_start"],
+                f"{target_output_col}_lv2_base": lv2_base,
+                f"{target_output_col}_lv3_multiplier_base": multiplier_base,
+                f"{target_output_col}_lv3_event_base_used": float(row.get("lv3_uses_weekly_avg_event_base", 0.0)),
+                f"{target_output_col}_lv3_model_multiplier": model_multiplier,
+                f"{target_output_col}_lv3_event_cap": multiplier_cap,
+                f"{target_output_col}_lv3_raw_multiplier": raw_multiplier,
+                f"{target_output_col}_lv3_backend": model.backend,
+                f"{target_output_col}_event_floor_multiplier": floor_multiplier,
+                f"{target_output_col}_event_floor_applied": float(floor_multiplier > (raw_multiplier + 1e-9)),
+                f"{target_output_col}_before_floor": multiplier_base * model_multiplier,
+                f"{target_output_col}_after_floor": pred_value,
+                f"{target_output_col}_lv3_multiplier": multiplier,
+                target_output_col: pred_value,
+                f"{target_output_col}_p10": multiplier_base * lo80_value,
+                f"{target_output_col}_p90": multiplier_base * hi80_value,
+                f"{target_output_col}_p05": multiplier_base * lo90_value,
+                f"{target_output_col}_p95": multiplier_base * hi90_value,
+            }
+        )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        order = {
+            pd.Timestamp(dt).normalize(): pos
+            for pos, dt in enumerate(pd.to_datetime(raw_pred["date"]))
+        }
+        out["_original_order"] = pd.to_datetime(out["date"]).map(order)
+        out = out.sort_values("_original_order").drop(columns=["_original_order"]).reset_index(drop=True)
     for col in out.columns:
-        if col not in {"date", "week_id", "week_start"}:
+        if col not in {"date", "week_id", "week_start", f"{target_output_col}_lv3_backend"}:
             out[col] = out[col].clip(lower=0.0)
     return out

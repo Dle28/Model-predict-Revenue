@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from .common import FOLDS
+from .common import FOLDS, YEARLY_ROLLING_ORIGIN_FOLDS
 from .final import forecast_daily_base_spikes
 from .lv1 import metric_frame
 
@@ -58,6 +58,15 @@ def _forecast_walk_forward_fold(
 def _safe_wape(actual: pd.Series, pred: pd.Series) -> float:
     metrics = metric_frame(actual.to_numpy(), pred.to_numpy(), "tmp")
     return float(metrics["tmp_wape"])
+
+
+def _safe_bias(actual: pd.Series, pred: pd.Series) -> float:
+    frame = pd.DataFrame({"actual": actual, "pred": pred}).replace([np.inf, -np.inf], np.nan).dropna()
+    if frame.empty:
+        return float("nan")
+    actual_sum = float(frame["actual"].sum())
+    pred_sum = float(frame["pred"].sum())
+    return float((pred_sum - actual_sum) / max(abs(actual_sum), 1e-9))
 
 
 def _add_weekly_drift_metrics(row: Dict[str, float | str], pred: pd.DataFrame) -> None:
@@ -140,6 +149,8 @@ def _event_floor_validation_rows(fold: str, daily_eval: pd.DataFrame) -> List[Di
 def _add_daily_slices(row: Dict[str, float | str], daily_eval: pd.DataFrame) -> None:
     if daily_eval.empty:
         return
+    row["daily_revenue_bias_all"] = _safe_bias(daily_eval["revenue"], daily_eval["Revenue"])
+    row["daily_cogs_bias_all"] = _safe_bias(daily_eval["cogs"], daily_eval["COGS"])
     for weekday in range(1, 8):
         mask = pd.to_datetime(daily_eval["date"]).dt.isocalendar().day.astype(int).eq(weekday)
         if mask.any():
@@ -155,8 +166,12 @@ def _add_daily_slices(row: Dict[str, float | str], daily_eval: pd.DataFrame) -> 
     high = daily_eval["revenue"].ge(q80)
     if low.any():
         row["daily_revenue_wape_low_bucket"] = _safe_wape(daily_eval.loc[low, "revenue"], daily_eval.loc[low, "Revenue"])
+        row["daily_revenue_bias_low_bucket"] = _safe_bias(daily_eval.loc[low, "revenue"], daily_eval.loc[low, "Revenue"])
+        row["daily_cogs_bias_low_bucket"] = _safe_bias(daily_eval.loc[low, "cogs"], daily_eval.loc[low, "COGS"])
     if high.any():
         row["daily_revenue_wape_high_bucket"] = _safe_wape(daily_eval.loc[high, "revenue"], daily_eval.loc[high, "Revenue"])
+        row["daily_revenue_bias_high_bucket"] = _safe_bias(daily_eval.loc[high, "revenue"], daily_eval.loc[high, "Revenue"])
+        row["daily_cogs_bias_high_bucket"] = _safe_bias(daily_eval.loc[high, "cogs"], daily_eval.loc[high, "COGS"])
     if {"Revenue_p10", "Revenue_p90"}.issubset(daily_eval.columns):
         row["daily_revenue_p10_p90_coverage"] = float(
             daily_eval["revenue"].between(daily_eval["Revenue_p10"], daily_eval["Revenue_p90"]).mean()
@@ -171,10 +186,12 @@ def run_backtests(
     daily: pd.DataFrame,
     weekly: pd.DataFrame,
     include_event_floor_table: bool = False,
+    folds: List[Tuple[str, str, str, str]] | None = None,
 ) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     event_rows: List[Dict[str, float | str]] = []
-    for tr_start, tr_end, va_start, va_end in FOLDS:
+    active_folds = folds if folds is not None else YEARLY_ROLLING_ORIGIN_FOLDS
+    for tr_start, tr_end, va_start, va_end in active_folds:
         train_mask = weekly["week_id"].between(tr_start, tr_end) & weekly["complete_target_week"]
         val_mask = weekly["week_id"].between(va_start, va_end) & weekly["complete_target_week"]
         val_week_ids = weekly.loc[val_mask, "week_id"].tolist()
@@ -256,8 +273,24 @@ def run_backtests(
             on="date",
             how="inner",
         )
-        row.update(metric_frame(daily_eval["revenue"], daily_eval["Revenue"], "daily_revenue"))
-        row.update(metric_frame(daily_eval["cogs"], daily_eval["COGS"], "daily_cogs"))
+        row.update(
+            metric_frame(
+                daily_eval["revenue"],
+                daily_eval["Revenue"],
+                "daily_revenue",
+                daily_eval["Revenue_p10"] if "Revenue_p10" in daily_eval.columns else None,
+                daily_eval["Revenue_p90"] if "Revenue_p90" in daily_eval.columns else None,
+            )
+        )
+        row.update(
+            metric_frame(
+                daily_eval["cogs"],
+                daily_eval["COGS"],
+                "daily_cogs",
+                daily_eval["COGS_p10"] if "COGS_p10" in daily_eval.columns else None,
+                daily_eval["COGS_p90"] if "COGS_p90" in daily_eval.columns else None,
+            )
+        )
         row["revenue_lv3_multiplier_max"] = float(daily_eval["Revenue_lv3_multiplier"].max())
         row["cogs_lv3_multiplier_max"] = float(daily_eval["COGS_lv3_multiplier"].max())
         _add_daily_slices(row, daily_eval)
@@ -267,3 +300,15 @@ def run_backtests(
     if include_event_floor_table:
         return metrics, pd.DataFrame(event_rows)
     return metrics
+
+
+def run_yearly_rolling_origin_cv(daily: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
+    result = run_backtests(
+        daily,
+        weekly,
+        include_event_floor_table=False,
+        folds=YEARLY_ROLLING_ORIGIN_FOLDS,
+    )
+    if isinstance(result, tuple):
+        return result[0]
+    return result

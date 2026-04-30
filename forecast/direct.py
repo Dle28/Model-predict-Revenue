@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -9,30 +10,16 @@ import pandas as pd
 from .lv1 import RidgeLogModel
 
 
-DIRECT_BLEND_WEIGHT = 0.80
+DIRECT_BLEND_WEIGHT = 0.10
 DIRECT_TARGET_LAGS = [1, 7, 14, 28]
 DIRECT_TARGET_WINDOWS = [7, 28]
 DIRECT_ACTIVITY_COLUMNS = [
-    "sessions",
-    "unique_visitors",
-    "page_views",
-    "source_entropy",
-    "orders_count",
-    "orders_per_session",
-    "new_customers",
     "active_promo_count",
+    "promo_flag",
     "avg_promo_discount_value",
     "stackable_promo_count",
-    "discount_rate",
-    "promo_intensity",
-    "aov",
-    "stockout_rate",
-    "fill_rate",
-    "return_rate",
-    "refund_rate",
-    "review_count",
-    "avg_rating",
-    "low_rating_share",
+    "revenue_shock_7d",
+    "cogs_shock_7d",
 ]
 
 
@@ -58,16 +45,16 @@ def direct_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     day_of_month = _numeric_feature(df, "day_of_month")
     day_of_year = _numeric_feature(df, "day_of_year")
 
-    out = pd.DataFrame(index=df.index)
-    out["time_index_day"] = _numeric_feature(df, "time_index_day")
+    features: Dict[str, pd.Series | np.ndarray | float] = {}
+    features["time_index_day"] = _numeric_feature(df, "time_index_day")
     for weekday in range(1, 8):
-        out[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
+        features[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
     for month_id in range(1, 13):
-        out[f"month_{month_id}"] = month.eq(month_id).astype(float)
-    out["dom_sin"] = np.sin(2 * np.pi * day_of_month / 31.0)
-    out["dom_cos"] = np.cos(2 * np.pi * day_of_month / 31.0)
-    out["doy_sin"] = np.sin(2 * np.pi * day_of_year / 366.0)
-    out["doy_cos"] = np.cos(2 * np.pi * day_of_year / 366.0)
+        features[f"month_{month_id}"] = month.eq(month_id).astype(float)
+    features["dom_sin"] = np.sin(2 * np.pi * day_of_month / 31.0)
+    features["dom_cos"] = np.cos(2 * np.pi * day_of_month / 31.0)
+    features["doy_sin"] = np.sin(2 * np.pi * day_of_year / 366.0)
+    features["doy_cos"] = np.cos(2 * np.pi * day_of_year / 366.0)
     for col in [
         "is_payday_window",
         "is_holiday",
@@ -80,23 +67,23 @@ def direct_daily_features(df: pd.DataFrame) -> pd.DataFrame:
         "is_month_start",
         "is_month_end",
     ]:
-        out[col] = _numeric_feature(df, col)
-    out["week_of_month"] = np.ceil(date.dt.day.astype(float) / 7.0)
+        features[col] = _numeric_feature(df, col)
+    features["week_of_month"] = np.ceil(date.dt.day.astype(float) / 7.0)
 
     for col in DIRECT_ACTIVITY_COLUMNS:
         raw = _numeric_feature(df, col)
-        out[col] = raw
-        out[f"log1p_{col}"] = np.log1p(raw.clip(lower=0.0))
+        features[col] = raw
+        features[f"log1p_{col}"] = np.log1p(raw.clip(lower=0.0))
     for lag in DIRECT_TARGET_LAGS:
         raw = _numeric_feature(df, f"target_lag_{lag}d")
-        out[f"log1p_target_lag_{lag}d"] = np.log1p(raw.clip(lower=0.0))
+        features[f"log1p_target_lag_{lag}d"] = np.log1p(raw.clip(lower=0.0))
     for window in DIRECT_TARGET_WINDOWS:
         raw = _numeric_feature(df, f"target_ma_{window}d")
-        out[f"log1p_target_ma_{window}d"] = np.log1p(raw.clip(lower=0.0))
+        features[f"log1p_target_ma_{window}d"] = np.log1p(raw.clip(lower=0.0))
     lag1 = _numeric_feature(df, "target_lag_1d")
     lag7 = _numeric_feature(df, "target_lag_7d")
-    out["target_growth_1d"] = np.clip((lag1 - lag7) / np.maximum(np.abs(lag7), 1e-9), -5.0, 5.0)
-    return out
+    features["target_growth_1d"] = np.clip((lag1 - lag7) / np.maximum(np.abs(lag7), 1e-9), -5.0, 5.0)
+    return pd.DataFrame(features, index=df.index).copy()
 
 
 def _history_map(daily: pd.DataFrame, target_col: str, end_date: pd.Timestamp) -> Dict[pd.Timestamp, float]:
@@ -132,8 +119,19 @@ def _attach_target_history_features(df: pd.DataFrame, values_by_date: Dict[pd.Ti
 
 def _activity_fill_values(train: pd.DataFrame) -> Dict[str, float]:
     values: Dict[str, float] = {}
+    zero_fill_cols = {
+        "active_promo_count",
+        "promo_flag",
+        "avg_promo_discount_value",
+        "stackable_promo_count",
+        "revenue_shock_7d",
+        "cogs_shock_7d",
+    }
     for col in DIRECT_ACTIVITY_COLUMNS:
         if col not in train.columns:
+            continue
+        if col in zero_fill_cols:
+            values[col] = 0.0
             continue
         series = train[col].replace([np.inf, -np.inf], np.nan)
         positive = series[series > 0]
@@ -150,6 +148,16 @@ def _fill_unknown_future_activity(df: pd.DataFrame, direct_model: DirectDailyMod
         missing_like = future_mask & out[col].replace([np.inf, -np.inf], np.nan).fillna(0.0).le(0.0)
         out.loc[missing_like, col] = fill_value
     return out
+
+
+def requested_direct_blend_weight(default: float = DIRECT_BLEND_WEIGHT) -> float:
+    raw = os.environ.get("FORECAST_DIRECT_BLEND_WEIGHT", "").strip()
+    if not raw:
+        return default
+    try:
+        return float(np.clip(float(raw), 0.0, 1.0))
+    except ValueError:
+        return default
 
 
 def fit_direct_daily_model(
@@ -194,7 +202,7 @@ def blend_direct_daily_forecast(
     daily_pred: pd.DataFrame,
     train_start_date: pd.Timestamp | None,
     train_end_date: pd.Timestamp,
-    blend_weight: float = DIRECT_BLEND_WEIGHT,
+    blend_weight: float | None = None,
 ) -> pd.DataFrame:
     out = daily_pred.copy()
     if not len(out):
@@ -204,7 +212,9 @@ def blend_direct_daily_forecast(
     future = daily[(daily["date"] > train_end_date) & (daily["date"] <= max_output_date)].copy()
     if future.empty:
         future = output_dates.merge(daily, on="date", how="left")
-    blend = float(np.clip(blend_weight, 0.0, 1.0))
+    blend = requested_direct_blend_weight() if blend_weight is None else float(np.clip(blend_weight, 0.0, 1.0))
+    if blend <= 0.0:
+        return out
     for source_col, output_col in [("revenue", "Revenue"), ("cogs", "COGS")]:
         direct_model = fit_direct_daily_model(daily, source_col, train_start_date, train_end_date)
         direct_frame = future.copy()

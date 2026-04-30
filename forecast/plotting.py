@@ -330,9 +330,6 @@ def save_submission_plot(
         forecast["COGS_p05"] = forecast["COGS"] * 0.78
         forecast["COGS_p95"] = forecast["COGS"] * 1.25
 
-    forecast_start = forecast["Date"].min()
-    hist = hist[hist["Date"].ge(forecast_start - pd.Timedelta(days=365))]
-
     hist_keep = hist[["Date", "ActualRevenue", "ActualCOGS"]]
     forecast_keep = forecast[
         [
@@ -380,6 +377,9 @@ def save_submission_plot(
 
     metric_row = metrics.iloc[0].to_dict() if len(metrics) else {}
     summary = {
+        "historyStart": hist["Date"].min().strftime("%Y-%m-%d") if len(hist) else None,
+        "historyEnd": hist["Date"].max().strftime("%Y-%m-%d") if len(hist) else None,
+        "historyDays": int(len(hist)),
         "forecastStart": forecast["Date"].min().strftime("%Y-%m-%d"),
         "forecastEnd": forecast["Date"].max().strftime("%Y-%m-%d"),
         "forecastDays": int(len(forecast)),
@@ -575,7 +575,7 @@ def save_submission_plot(
         <span class="legend-item"><span class="swatch"></span>Forecast</span>
         <span class="legend-item"><span class="swatch band"></span>P10-P90 interval</span>
       </div>
-      <div class="note">History shows the last 365 days before the submission horizon. Intervals are exported in outputs/submission_intervals.csv.</div>
+      <div class="note">History shows all available actual daily data before the submission horizon. Intervals are exported in outputs/submission_intervals.csv.</div>
     </section>
   </main>
 
@@ -610,7 +610,8 @@ def save_submission_plot(
     }
     function updateStats() {
       const isRevenue = metric === "revenue";
-      document.getElementById("horizon").textContent = `${SUMMARY.forecastStart} to ${SUMMARY.forecastEnd}`;
+      document.getElementById("horizon").textContent =
+        `Actual ${SUMMARY.historyStart} to ${SUMMARY.historyEnd} | Forecast ${SUMMARY.forecastStart} to ${SUMMARY.forecastEnd}`;
       document.getElementById("totalValue").textContent = money(isRevenue ? SUMMARY.totalRevenue : SUMMARY.totalCOGS);
       document.getElementById("weeklyMetric").textContent = isRevenue
         ? `${pct(SUMMARY.weeklyRevenueWape)} / ${r2(SUMMARY.weeklyRevenueR2)}`

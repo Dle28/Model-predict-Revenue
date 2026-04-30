@@ -74,16 +74,27 @@ def aggregate_orders_daily(cfg: Config) -> pd.DataFrame:
         usecols=["customer_id", "signup_date", "age_group", "acquisition_channel"],
     )
     orders = orders.merge(customers, on="customer_id", how="left")
+    orders = orders.sort_values(["customer_id", "order_date", "order_id"]).copy()
+    orders["order_seq"] = orders.groupby("customer_id").cumcount()
+    orders["previous_order_date"] = orders.groupby("customer_id")["order_date"].shift()
+    orders["inter_order_gap_days"] = (orders["order_date"] - orders["previous_order_date"]).dt.days
+    orders["first_purchase_order"] = orders["order_seq"].eq(0)
+    orders["repeat_purchase_order"] = orders["order_seq"].gt(0)
     orders["customer_tenure_days"] = (
         pd.to_datetime(orders["order_date"]).dt.normalize() - pd.to_datetime(orders["signup_date"]).dt.normalize()
     ).dt.days.clip(lower=0)
     orders["new_customer_order"] = pd.to_datetime(orders["order_date"]).dt.normalize().eq(
         pd.to_datetime(orders["signup_date"]).dt.normalize()
     )
+    orders["new_order_customer_id"] = orders["customer_id"].where(orders["new_customer_order"])
     out = orders.groupby("order_date", as_index=False).agg(
         orders_count=("order_id", "nunique"),
         active_customers=("customer_id", "nunique"),
-        new_order_customers=("customer_id", lambda s: s[orders.loc[s.index, "new_customer_order"]].nunique()),
+        new_order_customers=("new_order_customer_id", "nunique"),
+        first_purchase_orders=("first_purchase_order", "sum"),
+        repeat_purchase_orders=("repeat_purchase_order", "sum"),
+        avg_inter_order_gap_days=("inter_order_gap_days", "mean"),
+        median_inter_order_gap_days=("inter_order_gap_days", "median"),
         avg_customer_tenure_lag0=("customer_tenure_days", "mean"),
         cancelled_orders=("order_id", lambda s: 0),
     )
@@ -129,11 +140,13 @@ def aggregate_orders_daily(cfg: Config) -> pd.DataFrame:
         out[col] = out[col].fillna(0)
     out = _add_share_columns(out, raw_count_prefixes, "orders_count")
     out["cancel_rate"] = safe_div(out.get("cancelled_orders", 0), out["orders_count"])
+    out["cod_order_share"] = safe_div(out.get("orders_payment_cod", 0), out["orders_count"]).fillna(0.0)
     out["fulfilled_orders"] = out.get("delivered_orders", 0) + out.get("shipped_orders", 0)
     out["fulfilled_rate"] = safe_div(out["fulfilled_orders"], out["orders_count"])
     out["new_customer_ratio"] = safe_div(out["new_order_customers"], out["active_customers"]).fillna(0.0)
     out["repeat_customers"] = (out["active_customers"] - out["new_order_customers"]).clip(lower=0)
     out["repeat_customer_ratio"] = safe_div(out["repeat_customers"], out["active_customers"]).fillna(0.0)
+    out["repeat_order_share"] = safe_div(out["repeat_purchase_orders"], out["orders_count"]).fillna(0.0)
     out["orders_per_customer"] = safe_div(out["orders_count"], out["active_customers"]).fillna(0.0)
     out = out.rename(columns={"avg_customer_tenure_lag0": "avg_customer_tenure"})
     return out
@@ -142,22 +155,25 @@ def aggregate_orders_daily(cfg: Config) -> pd.DataFrame:
 def aggregate_basket_daily(cfg: Config) -> pd.DataFrame:
     orders = read_csv(cfg.data_dir / "orders.csv", parse_dates=["order_date"], usecols=["order_id", "order_date"])
     items = read_csv(cfg.data_dir / "order_items.csv")
-    products = read_csv(cfg.data_dir / "products.csv", usecols=["product_id", "category", "segment", "price", "cogs"])
+    products = read_csv(cfg.data_dir / "products.csv", usecols=["product_id", "category", "price"])
     items["gross_before_discount"] = items["quantity"] * items["unit_price"]
     items["net_before_refund"] = (items["gross_before_discount"] - items["discount_amount"]).clip(lower=0)
     items["promo_line"] = items["promo_id"].notna() | items["promo_id_2"].notna()
     items["stacked_promo_line"] = items["promo_id"].notna() & items["promo_id_2"].notna()
     merged = items.merge(products, on="product_id", how="left").merge(orders, on="order_id", how="left")
+    merged["promo_line_revenue"] = np.where(merged["promo_line"], merged["net_before_refund"], 0.0)
+    merged["promo_line_discount_amount"] = np.where(merged["promo_line"], merged["discount_amount"], 0.0)
     out = merged.groupby("order_date", as_index=False).agg(
         units=("quantity", "sum"),
         gross_before_discount=("gross_before_discount", "sum"),
         discount_amount=("discount_amount", "sum"),
         net_item_revenue_before_refund=("net_before_refund", "sum"),
+        promo_line_revenue=("promo_line_revenue", "sum"),
+        promo_line_discount_amount=("promo_line_discount_amount", "sum"),
         promo_orders=("order_id", lambda s: s[merged.loc[s.index, "promo_line"]].nunique()),
         stacked_promo_orders=("order_id", lambda s: s[merged.loc[s.index, "stacked_promo_line"]].nunique()),
         avg_unit_price=("unit_price", "mean"),
         avg_catalog_price=("price", "mean"),
-        item_cogs_amount=("cogs", lambda s: float((s * merged.loc[s.index, "quantity"]).sum())),
     )
     category = merged.pivot_table(
         index="order_date",
@@ -167,27 +183,11 @@ def aggregate_basket_daily(cfg: Config) -> pd.DataFrame:
         fill_value=0,
     ).reset_index()
     category = category.rename(columns={c: f"category_revenue_{_slug(c)}" for c in category.columns if c != "order_date"})
-    segment = merged.pivot_table(
-        index="order_date",
-        columns="segment",
-        values="net_before_refund",
-        aggfunc="sum",
-        fill_value=0,
-    ).reset_index()
-    segment = segment.rename(columns={c: f"segment_revenue_{_slug(c)}" for c in segment.columns if c != "order_date"})
-    out = out.merge(category, on="order_date", how="left").merge(segment, on="order_date", how="left")
+    out = out.merge(category, on="order_date", how="left")
     out = out.rename(columns={"order_date": "date"})
-    out = _add_share_columns(out, ["category_revenue_", "segment_revenue_"], "net_item_revenue_before_refund")
-    if "segment_revenue_premium" in out.columns:
-        out["premium_share"] = safe_div(out["segment_revenue_premium"], out["net_item_revenue_before_refund"]).fillna(0.0)
-    else:
-        out["premium_share"] = 0.0
-    if "segment_revenue_standard" in out.columns:
-        out["standard_share"] = safe_div(out["segment_revenue_standard"], out["net_item_revenue_before_refund"]).fillna(0.0)
-    else:
-        out["standard_share"] = 0.0
     out["promo_order_share"] = safe_div(out["promo_orders"], merged.groupby("order_date")["order_id"].nunique().reindex(out["date"]).to_numpy()).fillna(0.0)
     out["stacked_promo_share"] = safe_div(out["stacked_promo_orders"], merged.groupby("order_date")["order_id"].nunique().reindex(out["date"]).to_numpy()).fillna(0.0)
+    out["promo_discount_rate"] = safe_div(out["promo_line_discount_amount"], out["promo_line_revenue"] + out["promo_line_discount_amount"]).fillna(0.0)
     return out
 
 
@@ -224,14 +224,11 @@ def aggregate_shipments_daily(cfg: Config) -> pd.DataFrame:
 def aggregate_returns_daily(cfg: Config) -> pd.DataFrame:
     ret = read_csv(cfg.data_dir / "returns.csv", parse_dates=["return_date"])
     out = ret.groupby("return_date", as_index=False).agg(
+        return_records=("return_id", "nunique"),
         return_events=("order_id", "nunique"),
         returned_units=("return_quantity", "sum"),
         refund_amount=("refund_amount", "sum"),
         defective_returns=("return_reason", lambda s: (s == "defective").sum()),
-        wrong_size_returns=("return_reason", lambda s: (s == "wrong_size").sum()),
-        not_as_described_returns=("return_reason", lambda s: (s == "not_as_described").sum()),
-        changed_mind_returns=("return_reason", lambda s: (s == "changed_mind").sum()),
-        late_delivery_returns=("return_reason", lambda s: (s == "late_delivery").sum()),
     )
     return out.rename(columns={"return_date": "date"})
 
@@ -342,7 +339,7 @@ def aggregate_promotions_daily(cfg: Config, start_dt: pd.Timestamp, end_dt: pd.T
             merged[col] = value
     active = merged["active_promo_count"].fillna(0).gt(0)
     merged.loc[active, "days_to_promo"] = 0.0
-    merged["promo_intensity_day"] = merged["active_promo_count"] * merged["avg_promo_discount_value"]
+    merged["promo_intensity_day"] = merged["avg_promo_discount_value"].where(active, 0.0)
     return merged
 
 
@@ -374,7 +371,7 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         aggregate_customers_daily(cfg),
         aggregate_promotions_daily(cfg, start_dt, end_dt),
     ]
-    daily = merge_daily(spine, marts)
+    daily = merge_daily(spine, marts).sort_values("date").reset_index(drop=True)
     daily = add_calendar_columns(daily, "date")
     daily["time_index_day"] = np.arange(len(daily), dtype=float)
 
@@ -386,7 +383,6 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "customer_age_group_",
         "customer_acquisition_",
         "category_revenue_",
-        "segment_revenue_",
     )
     zero_fill_exact = {
         "sessions",
@@ -395,6 +391,8 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "orders_count",
         "active_customers",
         "new_order_customers",
+        "first_purchase_orders",
+        "repeat_purchase_orders",
         "repeat_customers",
         "created_orders",
         "paid_orders",
@@ -407,6 +405,8 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "gross_before_discount",
         "discount_amount",
         "net_item_revenue_before_refund",
+        "promo_line_revenue",
+        "promo_line_discount_amount",
         "promo_orders",
         "stacked_promo_orders",
         "stock_on_hand",
@@ -420,14 +420,11 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "shipment_orders",
         "shipping_fee",
         "delivered_orders_by_delivery_date",
+        "return_records",
         "return_events",
         "returned_units",
         "refund_amount",
         "defective_returns",
-        "wrong_size_returns",
-        "not_as_described_returns",
-        "changed_mind_returns",
-        "late_delivery_returns",
         "review_count",
         "low_rating_count",
         "new_customers",
@@ -446,6 +443,7 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "pageviews_per_session",
         "source_entropy",
         "cancel_rate",
+        "cod_order_share",
         "fulfilled_rate",
         "days_of_supply",
         "fill_rate",
@@ -458,18 +456,17 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         "days_since_promo_start",
         "days_until_promo_end",
         "avg_customer_tenure",
+        "avg_inter_order_gap_days",
+        "median_inter_order_gap_days",
         "avg_unit_price",
         "avg_catalog_price",
-        "item_cogs_amount",
-        "premium_share",
-        "standard_share",
+        "promo_discount_rate",
     ]
     for col in rate_cols:
         if col in daily.columns:
             daily[col] = daily[col].fillna(0)
 
     daily = daily.copy()
-    daily["aov"] = safe_div(daily["revenue"], daily["orders_count"]).replace([np.inf, -np.inf], np.nan)
     daily["items_per_order"] = safe_div(daily["units"], daily["orders_count"])
     daily["orders_per_customer"] = safe_div(daily["orders_count"], daily["active_customers"]).fillna(0.0)
     daily["discount_rate"] = safe_div(daily["discount_amount"], daily["gross_before_discount"])
@@ -477,19 +474,35 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
     daily["promo_intensity"] = safe_div(daily["promo_orders"], daily["orders_count"])
     daily["promo_order_share"] = safe_div(daily["promo_orders"], daily["orders_count"]).fillna(0.0)
     daily["stacked_promo_share"] = safe_div(daily["stacked_promo_orders"], daily["orders_count"]).fillna(0.0)
+    daily["promo_discount_rate"] = safe_div(daily["promo_line_discount_amount"], daily["promo_line_revenue"] + daily["promo_line_discount_amount"]).fillna(0.0)
     daily["return_rate"] = safe_div(daily["returned_orders"], daily["delivered_orders"].replace(0, np.nan)).fillna(0)
-    daily["refund_rate"] = safe_div(daily["refund_amount"], daily["revenue"]).replace([np.inf, -np.inf], np.nan).fillna(0)
     daily["stockout_rate"] = safe_div(daily["stockout_sku_days"], daily["active_sku_days"])
     daily["overstock_rate"] = safe_div(daily["overstock_sku_days"], daily["active_sku_days"]).fillna(0.0)
     daily["reorder_rate"] = safe_div(daily["reorder_sku_days"], daily["active_sku_days"]).fillna(0.0)
     daily["stock_pressure_index"] = daily["stockout_rate"].fillna(0.0) * daily["sessions"].fillna(0.0)
     daily["available_supply_index"] = daily["fill_rate"].fillna(0.0) * daily["days_of_supply"].fillna(0.0)
     daily["defective_ratio"] = safe_div(daily["defective_returns"], daily["return_events"]).fillna(0.0)
-    daily["wrong_size_ratio"] = safe_div(daily["wrong_size_returns"], daily["return_events"]).fillna(0.0)
-    daily["not_as_described_ratio"] = safe_div(daily["not_as_described_returns"], daily["return_events"]).fillna(0.0)
     daily["new_customer_ratio"] = safe_div(daily["new_order_customers"], daily["active_customers"]).fillna(0.0)
     daily["repeat_customer_ratio"] = safe_div(daily["repeat_customers"], daily["active_customers"]).fillna(0.0)
-
+    daily["repeat_order_share"] = safe_div(daily["repeat_purchase_orders"], daily["orders_count"]).fillna(0.0)
+    daily["cod_order_share"] = safe_div(daily.get("orders_payment_cod", 0), daily["orders_count"]).fillna(0.0)
+    daily["traffic_ma_7d"] = daily["sessions"].shift(1).rolling(7, min_periods=3).mean()
+    daily["traffic_growth_7d"] = (
+        safe_div(daily["sessions"], daily["traffic_ma_7d"])
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(1.0)
+        .clip(lower=0.0, upper=5.0)
+    )
+    daily["promo_flag"] = daily.get("active_promo_count", 0).fillna(0).gt(0).astype(float)
+    daily["new_customer_momentum_14d"] = (
+        daily["new_customers"]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .shift(1)
+        .rolling(14, min_periods=1)
+        .sum()
+        .fillna(0.0)
+    )
     for prefix, total_col in [
         ("sessions_source_", "sessions"),
         ("orders_source_", "orders_count"),
@@ -497,8 +510,6 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
         ("orders_payment_", "orders_count"),
         ("customer_age_group_", "orders_count"),
         ("customer_acquisition_", "orders_count"),
-        ("category_revenue_", "net_item_revenue_before_refund"),
-        ("segment_revenue_", "net_item_revenue_before_refund"),
     ]:
         raw_cols = [c for c in daily.columns if c.startswith(prefix) and not c.startswith(f"{prefix}share_")]
         for col in raw_cols:
@@ -511,6 +522,12 @@ def build_daily_mart(cfg: Config, sample: pd.DataFrame) -> pd.DataFrame:
             daily[f"{target}_lag_{lag}d"] = daily[target].shift(lag)
         daily[f"{target}_ma_7d"] = daily[target].shift(1).rolling(7, min_periods=2).mean()
         daily[f"{target}_ma_28d"] = daily[target].shift(1).rolling(28, min_periods=7).mean()
+        daily[f"{target}_shock_7d"] = (
+            safe_div((daily[f"{target}_lag_1d"] - daily[f"{target}_ma_7d"]).abs(), daily[f"{target}_ma_7d"])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .clip(lower=0.0, upper=5.0)
+        )
 
     if daily["date"].duplicated().any():
         raise ValueError("daily_mart has duplicate dates")
@@ -526,6 +543,7 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
         "pageviews_per_session",
         "source_entropy",
         "cancel_rate",
+        "cod_order_share",
         "fulfilled_rate",
         "days_of_supply",
         "fill_rate",
@@ -533,29 +551,27 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
         "avg_rating",
         "low_rating_share",
         "avg_promo_discount_value",
-        "aov",
         "items_per_order",
         "discount_rate",
         "promo_intensity",
         "promo_order_share",
         "stacked_promo_share",
+        "promo_discount_rate",
         "return_rate",
-        "refund_rate",
         "stockout_rate",
         "overstock_rate",
         "reorder_rate",
         "orders_per_customer",
         "avg_customer_tenure",
+        "avg_inter_order_gap_days",
+        "median_inter_order_gap_days",
         "avg_unit_price",
         "avg_catalog_price",
         "discount_amount_per_order",
-        "premium_share",
-        "standard_share",
         "defective_ratio",
-        "wrong_size_ratio",
-        "not_as_described_ratio",
         "new_customer_ratio",
         "repeat_customer_ratio",
+        "repeat_order_share",
     }
     excluded_calendar = {
         "iso_year",
@@ -580,8 +596,6 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
             or col.startswith("orders_payment_share_")
             or col.startswith("customer_age_group_share_")
             or col.startswith("customer_acquisition_share_")
-            or col.startswith("category_revenue_share_")
-            or col.startswith("segment_revenue_share_")
         )
     agg = {
         col: ("mean" if is_mean_col(col) else "sum")
@@ -625,18 +639,8 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
 
     weekly = weekly.rename(columns={"revenue": "revenue_w", "cogs": "cogs_w"})
     weekly.loc[~weekly["complete_target_week"], ["revenue_w", "cogs_w"]] = np.nan
-    lv1_scale = safe_div(7.0, weekly["lv1_non_holiday_days"])
-    usable_lv1_target = weekly["complete_target_week"] & weekly["lv1_non_holiday_days"].ge(4)
-    weekly["revenue_w_lv1_target"] = np.where(
-        usable_lv1_target,
-        weekly["revenue_w_non_holiday"] * lv1_scale,
-        weekly["revenue_w"],
-    )
-    weekly["cogs_w_lv1_target"] = np.where(
-        usable_lv1_target,
-        weekly["cogs_w_non_holiday"] * lv1_scale,
-        weekly["cogs_w"],
-    )
+    weekly["revenue_w_lv1_target"] = weekly["revenue_w"]
+    weekly["cogs_w_lv1_target"] = weekly["cogs_w"]
     weekly["has_holiday"] = weekly["holiday_days"].fillna(0).gt(0).astype(float)
 
     weekly["time_index_week"] = np.arange(len(weekly), dtype=float)
@@ -646,6 +650,7 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
     weekly["month_cos"] = np.cos(2 * np.pi * weekly["month"] / 12.0)
     weekly["promo_active_days"] = weekly.get("active_promo_count", 0)
     weekly["promo_has_active"] = (weekly["promo_active_days"] > 0).astype(float)
+    weekly["promo_flag"] = weekly["promo_has_active"]
     weekly["promo_discount_sum"] = weekly.get("avg_promo_discount_value", 0)
     weekly["promo_start_days"] = weekly.get("promo_start_day", 0)
     weekly["promo_end_days"] = weekly.get("promo_end_day", 0)
@@ -654,29 +659,54 @@ def build_weekly_mart(daily: pd.DataFrame) -> pd.DataFrame:
     weekly["is_payday_week"] = weekly.get("is_payday_window", 0).gt(0).astype(float)
     weekly["is_tet_like_period"] = weekly.get("is_tet_window", 0).gt(0).astype(float)
     weekly["is_black_friday_like_period"] = weekly.get("is_black_friday_window", 0).gt(0).astype(float)
-    weekly["aov"] = safe_div(weekly["revenue_w"], weekly.get("orders_count", 0)).replace([np.inf, -np.inf], np.nan)
     weekly["items_per_order"] = safe_div(weekly.get("units", 0), weekly.get("orders_count", 0))
     weekly["discount_rate"] = safe_div(weekly.get("discount_amount", 0), weekly.get("gross_before_discount", 0))
     weekly["promo_intensity"] = safe_div(weekly.get("promo_orders", 0), weekly.get("orders_count", 0))
     weekly["promo_order_share"] = safe_div(weekly.get("promo_orders", 0), weekly.get("orders_count", 0)).fillna(0)
     weekly["stacked_promo_share"] = safe_div(weekly.get("stacked_promo_orders", 0), weekly.get("orders_count", 0)).fillna(0)
+    weekly["promo_discount_rate"] = safe_div(
+        weekly.get("promo_line_discount_amount", 0),
+        weekly.get("promo_line_revenue", 0) + weekly.get("promo_line_discount_amount", 0),
+    ).fillna(0)
     weekly["return_rate"] = safe_div(weekly.get("returned_orders", 0), weekly.get("delivered_orders", 0)).replace([np.inf, -np.inf], np.nan).fillna(0)
-    weekly["refund_rate"] = safe_div(weekly.get("refund_amount", 0), weekly["revenue_w"]).replace([np.inf, -np.inf], np.nan).fillna(0)
     weekly["stockout_rate"] = safe_div(weekly.get("stockout_sku_days", 0), weekly.get("active_sku_days", 0))
     weekly["overstock_rate"] = safe_div(weekly.get("overstock_sku_days", 0), weekly.get("active_sku_days", 0)).fillna(0)
     weekly["reorder_rate"] = safe_div(weekly.get("reorder_sku_days", 0), weekly.get("active_sku_days", 0)).fillna(0)
     weekly["orders_per_session"] = safe_div(weekly.get("orders_count", 0), weekly.get("sessions", 0))
     weekly["orders_per_customer"] = safe_div(weekly.get("orders_count", 0), weekly.get("active_customers", 0)).fillna(0)
-    weekly["revenue_per_session"] = safe_div(weekly["revenue_w"], weekly.get("sessions", 0)).replace([np.inf, -np.inf], np.nan)
-    weekly["cogs_ratio_w"] = safe_div(weekly["cogs_w"], weekly["revenue_w"]).replace([np.inf, -np.inf], np.nan)
-    weekly["gross_margin_rate"] = 1.0 - weekly["cogs_ratio_w"]
     weekly["stock_pressure_index"] = weekly["stockout_rate"].fillna(0) * weekly.get("sessions", 0).fillna(0)
     weekly["available_supply_index"] = weekly["fill_rate"].fillna(0) * weekly["days_of_supply"].fillna(0)
+    weekly["traffic_ma_4w"] = weekly.get("sessions", 0).shift(1).rolling(4, min_periods=2).mean()
+    weekly["traffic_growth"] = (
+        safe_div(weekly.get("sessions", 0), weekly["traffic_ma_4w"])
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(1.0)
+        .clip(lower=0.0, upper=5.0)
+    )
+    weekly["traffic_vs_2015_2018_median"] = 1.0
+    baseline_mask = weekly["iso_year"].between(2015, 2018)
+    traffic_baseline = weekly.loc[baseline_mask, "sessions"].replace(0, np.nan).median()
+    if pd.notna(traffic_baseline) and traffic_baseline > EPS:
+        weekly["traffic_vs_2015_2018_median"] = (
+            safe_div(weekly.get("sessions", 0), traffic_baseline)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(1.0)
+            .clip(lower=0.0, upper=5.0)
+    )
     weekly["defective_ratio"] = safe_div(weekly.get("defective_returns", 0), weekly.get("return_events", 0)).fillna(0)
-    weekly["wrong_size_ratio"] = safe_div(weekly.get("wrong_size_returns", 0), weekly.get("return_events", 0)).fillna(0)
-    weekly["not_as_described_ratio"] = safe_div(weekly.get("not_as_described_returns", 0), weekly.get("return_events", 0)).fillna(0)
     weekly["new_customer_ratio"] = safe_div(weekly.get("new_order_customers", 0), weekly.get("active_customers", 0)).fillna(0)
     weekly["repeat_customers"] = (weekly.get("active_customers", 0) - weekly.get("new_order_customers", 0)).clip(lower=0)
     weekly["repeat_customer_ratio"] = safe_div(weekly["repeat_customers"], weekly.get("active_customers", 0)).fillna(0)
+    weekly["repeat_order_share"] = safe_div(weekly.get("repeat_purchase_orders", 0), weekly.get("orders_count", 0)).fillna(0)
+    weekly["cod_order_share"] = safe_div(weekly.get("orders_payment_cod", 0), weekly.get("orders_count", 0)).fillna(0)
+    for target in ["revenue_w", "cogs_w"]:
+        lag = weekly[target].shift(1)
+        ma4 = weekly[target].shift(1).rolling(4, min_periods=2).mean()
+        weekly[f"{target}_shock_4w"] = (
+            safe_div((lag - ma4).abs(), ma4)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .clip(lower=0.0, upper=5.0)
+        )
 
     return weekly.sort_values("week_start").reset_index(drop=True)

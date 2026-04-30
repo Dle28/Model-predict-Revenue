@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -9,6 +10,13 @@ import pandas as pd
 
 
 EPS = 1e-9
+
+
+def week_start_from_week_id(week_id: str) -> pd.Timestamp:
+    year_str, week_str = str(week_id).split("-W")
+    year = int(year_str)
+    week = int(week_str)
+    return pd.Timestamp(dt.date.fromisocalendar(year, week, 1))
 
 
 class Config:
@@ -35,17 +43,17 @@ TARGETS = {
     "COGS": "cogs",
 }
 
-FINAL_TRAIN_START_WEEK_ID = "2015-W01"
-FINAL_TRAIN_END_WEEK_ID = "2021-W52"
+FINAL_TRAIN_START_WEEK_ID = "2012-W28"
+FINAL_TRAIN_END_WEEK_ID = "2022-W51"
 
 PRE_COVID_END_WEEK_ID = "2019-W52"
 COVID_DROP_START_WEEK_ID = "2020-W01"
-COVID_DROP_END_WEEK_ID = "2022-W52"
-RECOVERY_START_WEEK_ID = "2023-W01"
-RECOVERY_END_WEEK_ID = "2023-W52"
-NORMALIZATION_START_WEEK_ID = "2024-W01"
-COVID_START_DATE = pd.Timestamp("2020-01-01")
-RECOVERY_START_DATE = pd.Timestamp("2023-01-01")
+COVID_DROP_END_WEEK_ID = "2022-W30"
+RECOVERY_START_WEEK_ID = "2022-W32"
+RECOVERY_END_WEEK_ID = "2024-W10"
+NORMALIZATION_START_WEEK_ID = "2024-W10"
+COVID_START_DATE = week_start_from_week_id(COVID_DROP_START_WEEK_ID)
+RECOVERY_START_DATE = week_start_from_week_id(RECOVERY_START_WEEK_ID)
 RECOVERY_PROGRESS_TAU_WEEKS = 32.0
 
 
@@ -53,6 +61,13 @@ FOLDS = [
     # Diagnostic holdout only. The final model trains from FINAL_TRAIN_START_WEEK_ID
     # through FINAL_TRAIN_END_WEEK_ID before forecasting 2023-2024.
     ("2015-W01", "2021-W52", "2022-W01", "2022-W51"),
+]
+
+YEARLY_ROLLING_ORIGIN_FOLDS = [
+    ("2012-W28", "2018-W52", "2019-W01", "2019-W52"),
+    ("2012-W28", "2019-W52", "2020-W01", "2020-W53"),
+    ("2012-W28", "2020-W53", "2021-W01", "2021-W52"),
+    ("2012-W28", "2021-W52", "2022-W01", "2022-W51"),
 ]
 
 
@@ -68,6 +83,7 @@ REQUIRED_FILES = [
     "reviews.csv",
     "customers.csv",
     "promotions.csv",
+    "products.csv",
 ]
 
 
@@ -94,6 +110,31 @@ def covid_regime_flags(week_id: str, week_start: pd.Timestamp) -> dict[str, floa
         "weeks_since_recovery_start": weeks_since_recovery_start,
         "recovery_progress": recovery_progress,
     }
+
+
+def covid_regime_flag_frame(week_id: pd.Series, week_start: pd.Series) -> pd.DataFrame:
+    week_id_series = pd.Series(week_id).astype(str)
+    week_start_values = pd.to_datetime(week_start)
+    if isinstance(week_start_values, pd.Series):
+        week_start_series = week_start_values.reindex(week_id_series.index)
+    else:
+        week_start_series = pd.Series(week_start_values, index=week_id_series.index)
+
+    weeks_since_covid_start = ((week_start_series - COVID_START_DATE).dt.days.astype(float) / 7.0).clip(lower=0.0)
+    weeks_since_recovery_start = ((week_start_series - RECOVERY_START_DATE).dt.days.astype(float) / 7.0).clip(lower=0.0)
+    recovery_progress = (1.0 - np.exp(-weeks_since_recovery_start / RECOVERY_PROGRESS_TAU_WEEKS)).clip(lower=0.0, upper=1.0)
+    return pd.DataFrame(
+        {
+            "pre_covid": week_id_series.le(PRE_COVID_END_WEEK_ID).astype(float),
+            "covid_drop": week_id_series.between(COVID_DROP_START_WEEK_ID, COVID_DROP_END_WEEK_ID).astype(float),
+            "recovery_phase": week_id_series.between(RECOVERY_START_WEEK_ID, RECOVERY_END_WEEK_ID).astype(float),
+            "normalization_phase": week_id_series.ge(NORMALIZATION_START_WEEK_ID).astype(float),
+            "weeks_since_covid_start": weeks_since_covid_start.astype(float),
+            "weeks_since_recovery_start": weeks_since_recovery_start.astype(float),
+            "recovery_progress": recovery_progress.astype(float),
+        },
+        index=week_id_series.index,
+    )
 
 
 def covid_allocation_regime(week_id: pd.Series) -> pd.Series:

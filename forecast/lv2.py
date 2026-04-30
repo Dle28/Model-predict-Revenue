@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .common import EPS, covid_allocation_regime, covid_regime_flags, safe_div
+from .common import EPS, covid_allocation_regime, covid_regime_flag_frame, safe_div
 from .lv1 import RidgeLogModel
 
 
 ALLOCATION_BLEND_CANDIDATES = [0.0, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00]
-ALLOCATION_TUNING_WEEKS = 13
+ALLOCATION_TUNING_WEEKS = 26
+ALLOCATION_SCORE_CLIP_LOWER = -12.0
+ALLOCATION_SCORE_CLIP_UPPER = 3.50
+DEFAULT_ALLOCATION_HISTORY_DECAY_HALFLIFE_WEEKS = 52.0
+MIN_ALLOCATION_HISTORY_DAYS_PER_WEEK = 5
+DEFAULT_ADJUSTMENT_MULTIPLIER_MAX = 1.50
+EVENT_ADJUSTMENT_MULTIPLIER_MAX = 2.50
 
 LV2_FEATURE_COLUMNS = [
     "date",
@@ -74,6 +81,46 @@ def normalize_weekly_weights(df: pd.DataFrame, weight_col: str = "weight") -> pd
     return pd.Series(np.where(denom > EPS, clipped / denom, fallback), index=df.index, dtype=float)
 
 
+def requested_allocation_history_decay_halflife_weeks() -> float:
+    raw = os.environ.get("FORECAST_LV2_HIST_DECAY_HALFLIFE_WEEKS", "").strip()
+    if not raw:
+        return DEFAULT_ALLOCATION_HISTORY_DECAY_HALFLIFE_WEEKS
+    try:
+        return float(np.clip(float(raw), 0.0, 520.0))
+    except ValueError:
+        return DEFAULT_ALLOCATION_HISTORY_DECAY_HALFLIFE_WEEKS
+
+
+def _attach_recency_weight(hist: pd.DataFrame, end_date: pd.Timestamp, half_life_weeks: float) -> pd.DataFrame:
+    out = hist.copy()
+    if half_life_weeks <= 0.0 or out.empty:
+        out["_recency_weight"] = 1.0
+        return out
+    age_weeks = (pd.Timestamp(end_date) - pd.to_datetime(out["date"])).dt.days.clip(lower=0) / 7.0
+    out["_recency_weight"] = np.power(0.5, age_weeks / max(half_life_weeks, EPS)).clip(lower=0.0, upper=1.0)
+    return out
+
+
+def _weighted_mean_table(df: pd.DataFrame, group_cols: List[str], value_col: str, output_col: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=group_cols + [output_col])
+    weight = df.get("_recency_weight", pd.Series(1.0, index=df.index)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    tmp = df[group_cols + [value_col]].copy()
+    tmp["_weighted_value"] = tmp[value_col].astype(float) * weight.astype(float)
+    tmp["_weight"] = weight.astype(float)
+    grouped = tmp.groupby(group_cols, as_index=False).agg(
+        _weighted_value=("_weighted_value", "sum"),
+        _weight=("_weight", "sum"),
+    )
+    grouped[output_col] = safe_div(grouped["_weighted_value"], grouped["_weight"]).replace([np.inf, -np.inf], np.nan)
+    return grouped[group_cols + [output_col]]
+
+
+def _keep_sufficient_history_weeks(hist: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    week_counts = hist.groupby("week_id")[target_col].transform("count")
+    return hist[week_counts.ge(MIN_ALLOCATION_HISTORY_DAYS_PER_WEEK)].copy()
+
+
 def historical_weight_tables(
     daily: pd.DataFrame,
     target_col: str,
@@ -87,14 +134,14 @@ def historical_weight_tables(
         weekday = pd.DataFrame({"iso_weekday": range(1, 8), "actual_weight": [1.0 / 7.0] * 7})
         return pd.DataFrame(columns=["month", "iso_weekday", "actual_weight"]), weekday, pd.DataFrame()
 
-    complete_week_counts = hist.groupby("week_id")[target_col].transform("count")
-    hist = hist[complete_week_counts.eq(7)].copy()
+    hist = _keep_sufficient_history_weeks(hist, target_col)
     week_sum = hist.groupby("week_id")[target_col].transform("sum")
     hist = hist[week_sum > EPS].copy()
     hist["actual_weight"] = hist[target_col] / week_sum[week_sum > EPS]
+    hist = _attach_recency_weight(hist, end_date, requested_allocation_history_decay_halflife_weeks())
 
-    month_weekday = hist.groupby(["month", "iso_weekday"], as_index=False)["actual_weight"].mean()
-    weekday = hist.groupby(["iso_weekday"], as_index=False)["actual_weight"].mean()
+    month_weekday = _weighted_mean_table(hist, ["month", "iso_weekday"], "actual_weight", "actual_weight")
+    weekday = _weighted_mean_table(hist, ["iso_weekday"], "actual_weight", "actual_weight")
     if weekday.empty:
         weekday = pd.DataFrame({"iso_weekday": range(1, 8), "actual_weight": [1.0 / 7.0] * 7})
     baseline = weekday.rename(columns={"actual_weight": "weekday_baseline"})
@@ -104,19 +151,33 @@ def historical_weight_tables(
         "is_month_start",
         "is_month_end",
         "is_holiday",
+        "is_black_friday_window",
+        "is_double_day_sale",
+        "is_1111_1212",
         "active_promo_count",
     ]
-    hist["_promo_near"] = hist.get("days_to_promo", 999.0).fillna(999.0).le(3).astype(int)
+    days_to_promo = hist["days_to_promo"] if "days_to_promo" in hist.columns else pd.Series(999.0, index=hist.index)
+    hist["_promo_near"] = days_to_promo.fillna(999.0).le(3).astype(int)
     adjustment_features.append("_promo_near")
     for feature in adjustment_features:
         if feature not in hist.columns:
             continue
-        tmp = hist[["iso_weekday", "actual_weight", feature]].copy()
+        tmp = hist[["iso_weekday", "actual_weight", feature, "_recency_weight"]].copy()
         tmp["feature"] = "promo_near" if feature == "_promo_near" else feature
         tmp["feature_value"] = tmp[feature].fillna(0).gt(0).astype(int)
-        effect = tmp.groupby(["feature", "feature_value", "iso_weekday"], as_index=False)["actual_weight"].mean()
+        effect = _weighted_mean_table(
+            tmp,
+            ["feature", "feature_value", "iso_weekday"],
+            "actual_weight",
+            "actual_weight",
+        )
         effect = effect.merge(baseline, on="iso_weekday", how="left")
-        effect["multiplier"] = safe_div(effect["actual_weight"], effect["weekday_baseline"]).clip(lower=0.70, upper=1.50)
+        upper = (
+            EVENT_ADJUSTMENT_MULTIPLIER_MAX
+            if feature in {"is_holiday", "is_black_friday_window", "is_double_day_sale", "is_1111_1212"}
+            else DEFAULT_ADJUSTMENT_MULTIPLIER_MAX
+        )
+        effect["multiplier"] = safe_div(effect["actual_weight"], effect["weekday_baseline"]).clip(lower=0.70, upper=upper)
         adjustment_rows.append(effect[["feature", "feature_value", "iso_weekday", "multiplier"]])
     adjustments = pd.concat(adjustment_rows, ignore_index=True) if adjustment_rows else pd.DataFrame(
         columns=["feature", "feature_value", "iso_weekday", "multiplier"]
@@ -162,8 +223,7 @@ def _allocation_regime(week_id: pd.Series) -> pd.Series:
 
 def _attach_regime_progress(out: pd.DataFrame) -> pd.DataFrame:
     week_start = pd.to_datetime(out["week_start"]) if "week_start" in out.columns else pd.to_datetime(out["date"])
-    flags = [covid_regime_flags(str(wid), wstart) for wid, wstart in zip(out["week_id"].astype(str), week_start)]
-    flag_frame = pd.DataFrame(flags, index=out.index)
+    flag_frame = covid_regime_flag_frame(out["week_id"].astype(str), week_start)
     for col in flag_frame.columns:
         out[col] = flag_frame[col].astype(float)
     return out
@@ -178,14 +238,15 @@ def _historical_allocation_tables(hist: pd.DataFrame) -> Tuple[pd.DataFrame, pd.
             pd.DataFrame(columns=["day_of_month", "hist_weight_day_of_month"]),
             pd.DataFrame(columns=["allocation_regime", "iso_weekday", "hist_weight_weekday_regime"]),
         )
-    month_weekday = hist.groupby(["month", "iso_weekday"], as_index=False)["actual_weight"].mean()
-    month_weekday = month_weekday.rename(columns={"actual_weight": "hist_weight_month_weekday"})
-    weekday = hist.groupby("iso_weekday", as_index=False)["actual_weight"].mean()
-    weekday = weekday.rename(columns={"actual_weight": "hist_weight_weekday"})
-    day_of_month = hist.groupby("day_of_month", as_index=False)["actual_weight"].mean()
-    day_of_month = day_of_month.rename(columns={"actual_weight": "hist_weight_day_of_month"})
-    weekday_regime = hist.groupby(["allocation_regime", "iso_weekday"], as_index=False)["actual_weight"].mean()
-    weekday_regime = weekday_regime.rename(columns={"actual_weight": "hist_weight_weekday_regime"})
+    month_weekday = _weighted_mean_table(hist, ["month", "iso_weekday"], "actual_weight", "hist_weight_month_weekday")
+    weekday = _weighted_mean_table(hist, ["iso_weekday"], "actual_weight", "hist_weight_weekday")
+    day_of_month = _weighted_mean_table(hist, ["day_of_month"], "actual_weight", "hist_weight_day_of_month")
+    weekday_regime = _weighted_mean_table(
+        hist,
+        ["allocation_regime", "iso_weekday"],
+        "actual_weight",
+        "hist_weight_weekday_regime",
+    )
     return month_weekday, weekday, day_of_month, weekday_regime
 
 
@@ -287,9 +348,9 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(index=df.index)
     out["bias"] = 1.0
-    for weekday in range(1, 8):
+    for weekday in range(1, 7):
         out[f"wday_{weekday}"] = iso_weekday.eq(weekday).astype(float)
-    for month_id in range(1, 13):
+    for month_id in range(1, 12):
         out[f"month_{month_id}"] = month.eq(month_id).astype(float)
     out["dom_sin"] = np.sin(2 * np.pi * day_of_month / 31.0)
     out["dom_cos"] = np.cos(2 * np.pi * day_of_month / 31.0)
@@ -360,7 +421,12 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def _softmax_weights(score: np.ndarray, week_id: pd.Series) -> np.ndarray:
     frame = pd.DataFrame({"week_id": week_id.to_numpy(), "score": np.asarray(score, dtype=float)})
-    frame["score"] = frame["score"].replace([np.inf, -np.inf], np.nan).fillna(-12.0).clip(lower=-12.0, upper=2.0)
+    frame["score"] = (
+        frame["score"]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(ALLOCATION_SCORE_CLIP_LOWER)
+        .clip(lower=ALLOCATION_SCORE_CLIP_LOWER, upper=ALLOCATION_SCORE_CLIP_UPPER)
+    )
     group_max = frame.groupby("week_id")["score"].transform("max")
     frame["exp_score"] = np.exp(frame["score"] - group_max)
     denom = frame.groupby("week_id")["exp_score"].transform("sum")
@@ -418,11 +484,11 @@ def fit_allocation_model(
     hist = daily[(daily["date"] <= train_end_date) & daily[target_col].notna()].copy()
     if train_start_date is not None:
         hist = hist[hist["date"] >= train_start_date].copy()
-    complete_week_counts = hist.groupby("week_id")[target_col].transform("count")
-    hist = hist[complete_week_counts.eq(7)].copy()
+    hist = _keep_sufficient_history_weeks(hist, target_col)
     week_sum = hist.groupby("week_id")[target_col].transform("sum")
     hist = hist[week_sum > EPS].copy()
     hist["actual_weight"] = hist[target_col] / week_sum[week_sum > EPS]
+    hist = _attach_recency_weight(hist, train_end_date, requested_allocation_history_decay_halflife_weeks())
     hist["allocation_regime"] = _allocation_regime(hist["week_id"].astype(str))
 
     month_weekday, weekday, day_of_month, weekday_regime = _historical_allocation_tables(hist)
@@ -483,7 +549,7 @@ def allocate_base_daily_dynamic(
         hist_score = np.log(out["hist_weight_blend"].clip(lower=1e-5).to_numpy())
         alpha = float(np.clip(model.score_blend_weight, 0.0, 1.0))
         score = hist_score + alpha * model_score
-    score = np.clip(score, -12.0, 2.0)
+    score = np.clip(score, ALLOCATION_SCORE_CLIP_LOWER, ALLOCATION_SCORE_CLIP_UPPER)
     out["_score"] = score
     group_max = out.groupby("week_id")["_score"].transform("max")
     out["_exp_score"] = np.exp(out["_score"] - group_max)
@@ -535,11 +601,16 @@ def daily_seasonal_shim(sales_daily: pd.DataFrame, dates: pd.Series, target_col:
     hist["month"] = hist["date"].dt.month
     hist["day"] = hist["date"].dt.day
 
-    full_years = hist[(hist["year"] >= 2013) & (hist["year"] <= 2022)]
-    annual = full_years.groupby("year")[target_col].sum()
-    yoy = annual.pct_change().dropna()
+    full_years = hist[(hist["year"] >= 2013) & (hist["year"] <= 2019)]
+    annual = full_years.groupby("year")[target_col].sum().sort_index()
+    yoy = annual.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    yoy = yoy.clip(lower=-0.25, upper=0.35)
     growth = float((1.0 + yoy).prod() ** (1.0 / len(yoy))) if len(yoy) else 1.0
-    base = float(annual.loc[2022] / 365.0) if 2022 in annual.index else float(hist[target_col].mean())
+    base_year = int(annual.index.max()) if len(annual) else int(hist["year"].max())
+    if len(annual):
+        base = float(annual.loc[base_year] / 365.0)
+    else:
+        base = float(hist[target_col].mean())
 
     year_mean = hist.groupby("year")[target_col].transform("mean")
     hist["norm"] = hist[target_col] / np.maximum(year_mean, EPS)
@@ -549,6 +620,6 @@ def daily_seasonal_shim(sales_daily: pd.DataFrame, dates: pd.Series, target_col:
     for dt in pd.to_datetime(dates):
         key = (int(dt.month), int(dt.day))
         norm = float(seasonal.get(key, 1.0))
-        years_ahead = int(dt.year) - 2022
+        years_ahead = int(dt.year) - base_year
         out.append(max(base * (growth**years_ahead) * norm, 0.0))
     return pd.Series(out, index=dates.index, dtype=float)
