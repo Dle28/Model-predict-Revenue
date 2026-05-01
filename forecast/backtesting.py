@@ -190,7 +190,7 @@ def run_backtests(
 ) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     event_rows: List[Dict[str, float | str]] = []
-    active_folds = folds if folds is not None else YEARLY_ROLLING_ORIGIN_FOLDS
+    active_folds = folds if folds is not None else FOLDS
     for tr_start, tr_end, va_start, va_end in active_folds:
         train_mask = weekly["week_id"].between(tr_start, tr_end) & weekly["complete_target_week"]
         val_mask = weekly["week_id"].between(va_start, va_end) & weekly["complete_target_week"]

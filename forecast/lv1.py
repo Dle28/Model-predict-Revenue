@@ -13,11 +13,12 @@ from .common import (
     EPS,
     NORMALIZATION_START_WEEK_ID,
     PRE_COVID_END_WEEK_ID,
-    RECOVERY_END_WEEK_ID,
     RECOVERY_START_WEEK_ID,
     covid_regime_flags,
     safe_div,
 )
+from .intervals import split_conformal_abs_quantile
+from .structural import fit_structural_weekly_model, requested_structural_weekly_weight, structural_weekly_features
 
 
 TARGET_LAGS = [1, 4, 52]
@@ -26,19 +27,47 @@ TARGET_VOL_WINDOWS: List[int] = []
 EXOGENOUS_LAGS = [1, 2]
 EXOGENOUS_WINDOWS = [4]
 EXOGENOUS_GROWTH_COLUMNS = {
-    "avg_promo_discount_value",
-    "promo_intensity_day",
-    "stackable_promo_count",
+    "lv1_avg_promo_discount_value",
 }
 SMOOTH_WINDOW_WEEKS = 5
 INTERVAL_RESIDUAL_SCALE = 1.50
 LV1_INTERVAL_VALIDATION_WEEKS = 52
 LV1_EXOGENOUS_BASE_COLUMNS: List[str] = [
-    "active_promo_count",
-    "avg_promo_discount_value",
-    "stackable_promo_count",
-    "promo_intensity_day",
+    "expected_orders_per_1000_sessions",
+    "orders_per_session_lag_14d",
+    "revenue_per_session_lag_28d",
+    "funnel_efficiency_lag_28d",
+    "expected_cod_order_share",
+    "expected_stockout_rate",
+    "expected_fill_rate",
+    "expected_top_product_revenue_share",
+    "expected_streetwear_concentration_risk",
+    "streetwear_concentration_risk",
+    "expected_promo_discount_rate",
+    "expected_promo_order_share",
+    "expected_lost_sales_index",
+    "promo_margin_pressure",
+    "lv1_active_promo_count",
+    "lv1_avg_promo_discount_value",
 ]
+FORECAST_SAFE_CURRENT_EXOGENOUS_COLUMNS = {
+    "expected_orders_per_1000_sessions",
+    "orders_per_session_lag_14d",
+    "revenue_per_session_lag_28d",
+    "funnel_efficiency_lag_28d",
+    "expected_cod_order_share",
+    "expected_stockout_rate",
+    "expected_fill_rate",
+    "expected_top_product_revenue_share",
+    "expected_streetwear_concentration_risk",
+    "streetwear_concentration_risk",
+    "expected_promo_discount_rate",
+    "expected_promo_order_share",
+    "expected_lost_sales_index",
+    "promo_margin_pressure",
+    "lv1_active_promo_count",
+    "lv1_avg_promo_discount_value",
+}
 LV1_EXOGENOUS_PREFIXES: List[str] = []
 
 
@@ -57,11 +86,15 @@ PRECOVID_BASELINE_QUANTILE = 0.60
 PRECOVID_BASELINE_MIN_WEEKS = 26
 SAME_ISO_GROWTH_MIN = 0.95
 SAME_ISO_GROWTH_MAX = 1.70
-SAME_ISO_GROWTH_RECOVERY_MAX_BONUS = 0.40
+SAME_ISO_GROWTH_RECOVERY_MAX_BONUS = 0.10
 NORMALIZATION_RECOVERY_GROWTH_RATE = 0.15
-RECOVERY_WEIGHT_NORMALIZATION_BASE = 0.20
-RECOVERY_WEIGHT_NORMALIZATION_SLOPE = 0.15
-MODEL_WEIGHT_NORMALIZATION_BASE = 0.45
+RECOVERY_WEIGHT_NORMALIZATION_BASE = 0.40
+RECOVERY_WEIGHT_NORMALIZATION_SLOPE = 0.10
+RECOVERY_WEIGHT_BASE = 0.40
+RECOVERY_WEIGHT_SLOPE = 0.10
+RECOVERY_MODEL_WEIGHT_BASE = 0.35
+RECOVERY_MODEL_WEIGHT_SLOPE = 0.05
+MODEL_WEIGHT_NORMALIZATION_BASE = 0.35
 MODEL_WEIGHT_NORMALIZATION_SLOPE = 0.05
 
 
@@ -76,7 +109,8 @@ LV1_BASE_WEEKLY_FEATURES = [
     "is_tet_like_period",
     "is_black_friday_like_period",
     "pre_covid",
-    "covid_drop",
+    "is_operational_crisis",
+    "internal_stress_regime",
     "pre_covid_baseline_same_week",
     "covid_adjusted_lag_52w",
     "target_growth_1w",
@@ -105,6 +139,7 @@ def lv1_exogenous_columns(weekly: pd.DataFrame) -> List[str]:
 def lv1_feature_columns(exog_columns: Iterable[str]) -> List[str]:
     feature_cols = list(LV1_BASE_WEEKLY_FEATURES)
     for col in exog_columns:
+        feature_cols.append(col)
         feature_cols.extend(f"{col}_lag_{lag}w" for lag in EXOGENOUS_LAGS)
         feature_cols.extend(f"{col}_ma_{window}w" for window in EXOGENOUS_WINDOWS)
         if col in EXOGENOUS_GROWTH_COLUMNS:
@@ -254,8 +289,8 @@ class WeeklyBaseLogModel:
         residual = residual[np.isfinite(residual)]
         if len(residual):
             self.log_adjustment = 0.0
-            self.abs_residual_q80 = float(np.quantile(np.abs(residual), 0.80))
-            self.abs_residual_q90 = float(np.quantile(np.abs(residual), 0.90))
+            self.abs_residual_q80 = split_conformal_abs_quantile(residual, 0.80, self.abs_residual_q80)
+            self.abs_residual_q90 = split_conformal_abs_quantile(residual, 0.90, self.abs_residual_q90)
             self.bias_factor = 1.0
         return self
 
@@ -263,8 +298,8 @@ class WeeklyBaseLogModel:
         residual_values = np.asarray(residual, dtype=float)
         residual_values = residual_values[np.isfinite(residual_values)]
         if len(residual_values):
-            self.abs_residual_q80 = float(np.quantile(np.abs(residual_values), 0.80))
-            self.abs_residual_q90 = float(np.quantile(np.abs(residual_values), 0.90))
+            self.abs_residual_q80 = split_conformal_abs_quantile(residual_values, 0.80, self.abs_residual_q80)
+            self.abs_residual_q90 = split_conformal_abs_quantile(residual_values, 0.90, self.abs_residual_q90)
 
     def _clean(self, X: pd.DataFrame) -> pd.DataFrame:
         if self.medians is None:
@@ -416,6 +451,7 @@ def make_exogenous_maps(
             "by_iso": by_iso,
             "by_week": by_week,
             "fallback": float(np.nanmedian(vals)) if vals else 0.0,
+            "known_end_pos": int(known_end_pos),
         }
     return maps
 
@@ -431,6 +467,12 @@ def exogenous_value(
     by_iso: Dict[Tuple[int, int], float] = col_map.get("by_iso", {})
     by_week: Dict[int, List[Tuple[int, float]]] = col_map.get("by_week", {})
     fallback = float(col_map.get("fallback", 0.0))
+    known_end_pos = int(col_map.get("known_end_pos", -1))
+    if 0 <= target_pos < len(weekly) and col in weekly.columns:
+        current = weekly.iloc[target_pos][col]
+        if pd.notna(current) and np.isfinite(current):
+            if target_pos <= known_end_pos or col in FORECAST_SAFE_CURRENT_EXOGENOUS_COLUMNS:
+                return float(current)
     if target_pos in by_pos:
         return by_pos[target_pos]
     if target_pos < 0 or target_pos >= len(weekly):
@@ -459,6 +501,7 @@ def add_exogenous_history_features(
     exog_maps: Dict[str, Dict[str, Any]],
 ) -> None:
     lag_values: Dict[int, float] = {}
+    features[col] = exogenous_value(weekly, pos, col, exog_maps)
     for lag in EXOGENOUS_LAGS:
         val = exogenous_value(weekly, pos - lag, col, exog_maps)
         lag_values[lag] = val
@@ -877,8 +920,12 @@ def lv1_prediction_blend_weights(feat: Dict[str, float]) -> Tuple[float, float, 
         recovery_weight = recovery_base + recovery_slope * progress
         model_weight = model_base - model_slope * progress
     else:
-        recovery_weight = 0.10 + 0.25 * progress
-        model_weight = 0.65 - 0.15 * progress
+        recovery_base = requested_float("FORECAST_RECOVERY_WEIGHT_BASE", RECOVERY_WEIGHT_BASE, 0.0, 0.90)
+        recovery_slope = requested_float("FORECAST_RECOVERY_WEIGHT_SLOPE", RECOVERY_WEIGHT_SLOPE, 0.0, 0.90)
+        model_base = requested_float("FORECAST_RECOVERY_MODEL_WEIGHT_BASE", RECOVERY_MODEL_WEIGHT_BASE, 0.0, 0.90)
+        model_slope = requested_float("FORECAST_RECOVERY_MODEL_WEIGHT_SLOPE", RECOVERY_MODEL_WEIGHT_SLOPE, 0.0, 0.90)
+        recovery_weight = recovery_base + recovery_slope * progress
+        model_weight = model_base - model_slope * progress
     same_iso_weight = 1.0 - model_weight - recovery_weight
     weights = np.asarray([model_weight, same_iso_weight, recovery_weight], dtype=float)
     weights = np.clip(weights, 0.0, 1.0)
@@ -893,8 +940,8 @@ def lv1_training_sample_weight(weekly: pd.DataFrame) -> pd.Series:
     week_id = weekly["week_id"].astype(str)
     weight = pd.Series(1.0, index=weekly.index, dtype=float)
     weight = weight.mask(week_id.between(COVID_DROP_START_WEEK_ID, COVID_DROP_END_WEEK_ID), 0.45)
-    weight = weight.mask(week_id.between(RECOVERY_START_WEEK_ID, RECOVERY_END_WEEK_ID), 1.30)
-    weight = weight.mask(week_id.ge(NORMALIZATION_START_WEEK_ID), 1.50)
+    recovery_mask = week_id.ge(RECOVERY_START_WEEK_ID) & week_id.lt(NORMALIZATION_START_WEEK_ID)
+    weight = weight.mask(recovery_mask, 1.20)
     return weight
 
 
@@ -905,17 +952,17 @@ def recovery_weekly_guardrail(pred: float, feat: Dict[str, float]) -> float:
         and pd.notna(baseline)
         and np.isfinite(baseline)
         and baseline > EPS
-        and pred < baseline * 0.85
+        and pred < baseline * 0.65
     ):
-        return 0.70 * pred + 0.30 * float(baseline)
+        return 0.95 * pred + 0.05 * float(baseline)
     if (
         feat.get("recovery_phase", 0.0) > 0
         and pd.notna(baseline)
         and np.isfinite(baseline)
         and baseline > EPS
-        and pred < baseline * 0.85
+        and pred < baseline * 0.65
     ):
-        return 0.85 * pred + 0.15 * float(baseline)
+        return 0.95 * pred + 0.05 * float(baseline)
     return pred
 
 
@@ -948,6 +995,15 @@ def forecast_weekly_base_recursive(
     train_start_week_id: Optional[str] = None,
 ) -> pd.DataFrame:
     model, values, _ = fit_lv1_weekly_model(weekly, target_col, train_end_week_id, train_start_week_id)
+    structural_weight = requested_structural_weekly_weight()
+    structural_model = None
+    structural_features = pd.DataFrame(index=weekly.index)
+    if structural_weight > 0.0:
+        try:
+            structural_model = fit_structural_weekly_model(weekly, target_col, train_end_week_id, train_start_week_id)
+            structural_features = structural_weekly_features(weekly)
+        except Exception:
+            structural_weight = 0.0
 
     forecast_set = set(forecast_week_ids)
     if not forecast_set:
@@ -1000,11 +1056,23 @@ def forecast_weekly_base_recursive(
             + same_iso_weight * same_iso_pred
             + recovery_weight * recovery_anchor
         )
+        structural_pred = np.nan
+        if structural_model is not None and structural_weight > 0.0:
+            structural_pred = float(structural_model.predict_value(structural_features.loc[[pos]])[0])
+            if np.isfinite(structural_pred):
+                pred = (1.0 - structural_weight) * pred + structural_weight * max(structural_pred, 0.0)
         horizon = len(predictions) + 1
         pred = recovery_weekly_guardrail(pred, feat_dict)
         interval_log = float(np.log1p(pred))
         pred_p10, pred_p90 = model.interval(interval_log, horizon, coverage=0.80)
         pred_p05, pred_p95 = model.interval(interval_log, horizon, coverage=0.90)
+        if structural_model is not None and structural_weight > 0.0:
+            structural_p10, structural_p90 = structural_model.interval(interval_log, horizon, coverage=0.80)
+            structural_p05, structural_p95 = structural_model.interval(interval_log, horizon, coverage=0.90)
+            pred_p10 = min(pred_p10, structural_p10)
+            pred_p90 = max(pred_p90, structural_p90)
+            pred_p05 = min(pred_p05, structural_p05)
+            pred_p95 = max(pred_p95, structural_p95)
         values.iloc[int(pos)] = pred
         values_by_pos[int(pos)] = pred
         values_by_iso[(int(row["iso_year"]), int(row["iso_week"]))] = pred
@@ -1025,6 +1093,8 @@ def forecast_weekly_base_recursive(
                 f"{target_col}_same_iso_weight": same_iso_weight,
                 f"{target_col}_recovery_weight": recovery_weight,
                 f"{target_col}_recovery_anchor": recovery_anchor,
+                f"{target_col}_structural_pred": structural_pred,
+                f"{target_col}_structural_weight": structural_weight,
                 f"{target_col}_direct_anchor_pred": np.nan,
                 f"{target_col}_direct_anchor_weight": 0.0,
                 f"{target_col}_lv1_backend": model.backend,

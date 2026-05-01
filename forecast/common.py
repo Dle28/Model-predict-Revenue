@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -48,9 +49,9 @@ FINAL_TRAIN_END_WEEK_ID = "2022-W51"
 
 PRE_COVID_END_WEEK_ID = "2019-W52"
 COVID_DROP_START_WEEK_ID = "2020-W01"
-COVID_DROP_END_WEEK_ID = "2022-W30"
-RECOVERY_START_WEEK_ID = "2022-W32"
-RECOVERY_END_WEEK_ID = "2024-W10"
+COVID_DROP_END_WEEK_ID = "2021-W52"
+RECOVERY_START_WEEK_ID = "2022-W01"
+RECOVERY_END_WEEK_ID = "2099-W52"
 NORMALIZATION_START_WEEK_ID = "2024-W10"
 COVID_START_DATE = week_start_from_week_id(COVID_DROP_START_WEEK_ID)
 RECOVERY_START_DATE = week_start_from_week_id(RECOVERY_START_WEEK_ID)
@@ -58,9 +59,9 @@ RECOVERY_PROGRESS_TAU_WEEKS = 32.0
 
 
 FOLDS = [
-    # Diagnostic holdout only. The final model trains from FINAL_TRAIN_START_WEEK_ID
-    # through FINAL_TRAIN_END_WEEK_ID before forecasting 2023-2024.
-    ("2015-W01", "2021-W52", "2022-W01", "2022-W51"),
+    # Diagnostic holdout: learn the post-2018 operating regime, then test 2022.
+    # The final submission forecast still trains through FINAL_TRAIN_END_WEEK_ID.
+    ("2019-W01", "2021-W52", "2022-W01", "2022-W51"),
 ]
 
 YEARLY_ROLLING_ORIGIN_FOLDS = [
@@ -104,7 +105,7 @@ def covid_regime_flags(week_id: str, week_start: pd.Timestamp) -> dict[str, floa
     return {
         "pre_covid": float(week_id <= PRE_COVID_END_WEEK_ID),
         "covid_drop": float(COVID_DROP_START_WEEK_ID <= week_id <= COVID_DROP_END_WEEK_ID),
-        "recovery_phase": float(RECOVERY_START_WEEK_ID <= week_id <= RECOVERY_END_WEEK_ID),
+        "recovery_phase": float(RECOVERY_START_WEEK_ID <= week_id < NORMALIZATION_START_WEEK_ID),
         "normalization_phase": float(week_id >= NORMALIZATION_START_WEEK_ID),
         "weeks_since_covid_start": weeks_since_covid_start,
         "weeks_since_recovery_start": weeks_since_recovery_start,
@@ -127,7 +128,9 @@ def covid_regime_flag_frame(week_id: pd.Series, week_start: pd.Series) -> pd.Dat
         {
             "pre_covid": week_id_series.le(PRE_COVID_END_WEEK_ID).astype(float),
             "covid_drop": week_id_series.between(COVID_DROP_START_WEEK_ID, COVID_DROP_END_WEEK_ID).astype(float),
-            "recovery_phase": week_id_series.between(RECOVERY_START_WEEK_ID, RECOVERY_END_WEEK_ID).astype(float),
+            "recovery_phase": (
+                week_id_series.ge(RECOVERY_START_WEEK_ID) & week_id_series.lt(NORMALIZATION_START_WEEK_ID)
+            ).astype(float),
             "normalization_phase": week_id_series.ge(NORMALIZATION_START_WEEK_ID).astype(float),
             "weeks_since_covid_start": weeks_since_covid_start.astype(float),
             "weeks_since_recovery_start": weeks_since_recovery_start.astype(float),
@@ -141,7 +144,7 @@ def covid_allocation_regime(week_id: pd.Series) -> pd.Series:
     labels = pd.Series("pre_covid", index=week_id.index, dtype=object)
     week_id = week_id.astype(str)
     labels = labels.mask(week_id.between(COVID_DROP_START_WEEK_ID, COVID_DROP_END_WEEK_ID), "covid_drop")
-    labels = labels.mask(week_id.between(RECOVERY_START_WEEK_ID, RECOVERY_END_WEEK_ID), "recovery_phase")
+    labels = labels.mask(week_id.ge(RECOVERY_START_WEEK_ID) & week_id.lt(NORMALIZATION_START_WEEK_ID), "recovery_phase")
     labels = labels.mask(week_id.ge(NORMALIZATION_START_WEEK_ID), "normalization_phase")
     return labels
 
@@ -160,29 +163,123 @@ def _black_friday_dates(years: range) -> set[pd.Timestamp]:
     return dates
 
 
-def _tet_window_dates() -> set[pd.Timestamp]:
-    tet_new_year_days = [
-        "2012-01-23",
-        "2013-02-10",
-        "2014-01-31",
-        "2015-02-19",
-        "2016-02-08",
-        "2017-01-28",
-        "2018-02-16",
-        "2019-02-05",
-        "2020-01-25",
-        "2021-02-12",
-        "2022-02-01",
-        "2023-01-22",
-        "2024-02-10",
-        "2025-01-29",
-        "2026-02-17",
-    ]
+def _jd_from_date(day: int, month: int, year: int) -> int:
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    return day + (153 * m + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
+
+
+def _date_from_jd(jd: int) -> tuple[int, int, int]:
+    a = jd + 32044
+    b = (4 * a + 3) // 146097
+    c = a - (b * 146097) // 4
+    d = (4 * c + 3) // 1461
+    e = c - (1461 * d) // 4
+    m = (5 * e + 2) // 153
+    day = e - (153 * m + 2) // 5 + 1
+    month = m + 3 - 12 * (m // 10)
+    year = b * 100 + d - 4800 + m // 10
+    return day, month, year
+
+
+def _new_moon_day(k: int, time_zone: float = 7.0) -> int:
+    t = k / 1236.85
+    t2 = t * t
+    t3 = t2 * t
+    dr = math.pi / 180.0
+    jd1 = 2415020.75933 + 29.53058868 * k + 0.0001178 * t2 - 0.000000155 * t3
+    jd1 += 0.00033 * math.sin((166.56 + 132.87 * t - 0.009173 * t2) * dr)
+    m = 359.2242 + 29.10535608 * k - 0.0000333 * t2 - 0.00000347 * t3
+    mpr = 306.0253 + 385.81691806 * k + 0.0107306 * t2 + 0.00001236 * t3
+    f = 21.2964 + 390.67050646 * k - 0.0016528 * t2 - 0.00000239 * t3
+    c1 = (0.1734 - 0.000393 * t) * math.sin(m * dr) + 0.0021 * math.sin(2 * dr * m)
+    c1 -= 0.4068 * math.sin(mpr * dr) + 0.0161 * math.sin(2 * dr * mpr)
+    c1 -= 0.0004 * math.sin(3 * dr * mpr)
+    c1 += 0.0104 * math.sin(2 * dr * f) - 0.0051 * math.sin((m + mpr) * dr)
+    c1 -= 0.0074 * math.sin((m - mpr) * dr) + 0.0004 * math.sin((2 * f + m) * dr)
+    c1 -= 0.0004 * math.sin((2 * f - m) * dr) - 0.0006 * math.sin((2 * f + mpr) * dr)
+    c1 += 0.0010 * math.sin((2 * f - mpr) * dr) + 0.0005 * math.sin((2 * mpr + m) * dr)
+    if t < -11:
+        delta_t = 0.001 + 0.000839 * t + 0.0002261 * t2 - 0.00000845 * t3 - 0.000000081 * t * t3
+    else:
+        delta_t = -0.000278 + 0.000265 * t + 0.000262 * t2
+    return int(jd1 + c1 - delta_t + 0.5 + time_zone / 24.0)
+
+
+def _sun_longitude_segment(jdn: int, time_zone: float = 7.0) -> int:
+    t = (jdn - 2451545.5 - time_zone / 24.0) / 36525.0
+    t2 = t * t
+    dr = math.pi / 180.0
+    m = 357.52910 + 35999.05030 * t - 0.0001559 * t2 - 0.00000048 * t * t2
+    l0 = 280.46645 + 36000.76983 * t + 0.0003032 * t2
+    dl = (1.914600 - 0.004817 * t - 0.000014 * t2) * math.sin(dr * m)
+    dl += (0.019993 - 0.000101 * t) * math.sin(2 * dr * m) + 0.000290 * math.sin(3 * dr * m)
+    longitude = (l0 + dl) * dr
+    longitude -= math.pi * 2 * math.floor(longitude / (math.pi * 2))
+    return int(longitude / math.pi * 6)
+
+
+def _lunar_month_11(year: int, time_zone: float = 7.0) -> int:
+    off = _jd_from_date(31, 12, year) - 2415021
+    k = int(off / 29.530588853)
+    nm = _new_moon_day(k, time_zone)
+    if _sun_longitude_segment(nm, time_zone) >= 9:
+        nm = _new_moon_day(k - 1, time_zone)
+    return nm
+
+
+def _leap_month_offset(a11: int, time_zone: float = 7.0) -> int:
+    k = int(0.5 + (a11 - 2415021.076998695) / 29.530588853)
+    last = 0
+    i = 1
+    arc = _sun_longitude_segment(_new_moon_day(k + i, time_zone), time_zone)
+    while arc != last and i < 14:
+        last = arc
+        i += 1
+        arc = _sun_longitude_segment(_new_moon_day(k + i, time_zone), time_zone)
+    return i - 1
+
+
+def _vietnam_lunar_to_solar_date(day: int, month: int, year: int, leap: int = 0) -> pd.Timestamp:
+    if month < 11:
+        a11 = _lunar_month_11(year - 1)
+        b11 = _lunar_month_11(year)
+    else:
+        a11 = _lunar_month_11(year)
+        b11 = _lunar_month_11(year + 1)
+    k = int(0.5 + (a11 - 2415021.076998695) / 29.530588853)
+    off = month - 11
+    if off < 0:
+        off += 12
+    if b11 - a11 > 365:
+        leap_off = _leap_month_offset(a11)
+        leap_month = leap_off - 2
+        if leap_month < 0:
+            leap_month += 12
+        if leap and month != leap_month:
+            raise ValueError(f"Invalid leap lunar month {month} for year {year}")
+        if leap or off >= leap_off:
+            off += 1
+    month_start = _new_moon_day(k + off)
+    solar_day, solar_month, solar_year = _date_from_jd(month_start + day - 1)
+    return pd.Timestamp(dt.date(solar_year, solar_month, solar_day))
+
+
+def _tet_window_dates(years: range) -> set[pd.Timestamp]:
     dates = set()
-    for dt in pd.to_datetime(tet_new_year_days):
+    for year in years:
+        dt = _vietnam_lunar_to_solar_date(1, 1, int(year))
         for offset in range(-3, 4):
             dates.add(pd.Timestamp(dt + pd.Timedelta(days=offset)).normalize())
     return dates
+
+
+def _hung_kings_dates(years: range) -> set[pd.Timestamp]:
+    return {
+        _vietnam_lunar_to_solar_date(10, 3, int(year)).normalize()
+        for year in years
+    }
 
 
 def add_calendar_columns(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
@@ -217,11 +314,15 @@ def add_calendar_columns(df: pd.DataFrame, date_col: str = "date") -> pd.DataFra
     )
     years = range(int(out["iso_year"].min()) - 1, int(out["iso_year"].max()) + 2)
     normalized_date = out[date_col].dt.normalize()
-    tet_dates = _tet_window_dates()
+    tet_dates = _tet_window_dates(years)
+    hung_kings_dates = _hung_kings_dates(years)
     black_friday_dates = _black_friday_dates(years)
-    holiday_dates = tet_dates | black_friday_dates
+    lunar_holiday_dates = tet_dates | hung_kings_dates
+    holiday_dates = lunar_holiday_dates | black_friday_dates
     out["is_holiday"] = (fixed_retail_holiday | out[date_col].dt.normalize().isin(holiday_dates)).astype(int)
     out["is_tet_window"] = normalized_date.isin(tet_dates).astype(int)
+    out["is_hung_kings_day"] = normalized_date.isin(hung_kings_dates).astype(int)
+    out["is_lunar_holiday"] = normalized_date.isin(lunar_holiday_dates).astype(int)
     out["is_black_friday_window"] = normalized_date.isin(black_friday_dates).astype(int)
     out["is_double_day_sale"] = ((out["month"] == out["day_of_month"]) & out["month"].isin([9, 10, 11, 12])).astype(int)
     out["is_1111_1212"] = (

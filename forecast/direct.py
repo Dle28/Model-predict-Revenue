@@ -10,7 +10,9 @@ import pandas as pd
 from .lv1 import RidgeLogModel
 
 
-DIRECT_BLEND_WEIGHT = 0.10
+DIRECT_BLEND_WEIGHT = 0.0
+DIRECT_BLEND_DECAY_START_DAYS = 91.0
+DIRECT_BLEND_DECAY_END_DAYS = 365.0
 DIRECT_TARGET_LAGS = [1, 7, 14, 28]
 DIRECT_TARGET_WINDOWS = [7, 28]
 DIRECT_ACTIVITY_COLUMNS = [
@@ -18,6 +20,23 @@ DIRECT_ACTIVITY_COLUMNS = [
     "promo_flag",
     "avg_promo_discount_value",
     "stackable_promo_count",
+    "promo_projected_flag",
+    "expected_orders_per_1000_sessions",
+    "orders_per_session_lag_14d",
+    "revenue_per_session_lag_28d",
+    "funnel_efficiency_lag_28d",
+    "expected_cod_order_share",
+    "expected_stockout_rate",
+    "expected_fill_rate",
+    "expected_top_product_revenue_share",
+    "expected_streetwear_concentration_risk",
+    "streetwear_concentration_risk",
+    "expected_promo_order_share",
+    "expected_promo_discount_rate",
+    "expected_lost_sales_index",
+    "promo_margin_pressure",
+    "is_operational_crisis",
+    "internal_stress_regime",
     "revenue_shock_7d",
     "cogs_shock_7d",
 ]
@@ -59,6 +78,8 @@ def direct_daily_features(df: pd.DataFrame) -> pd.DataFrame:
         "is_payday_window",
         "is_holiday",
         "is_tet_window",
+        "is_hung_kings_day",
+        "is_lunar_holiday",
         "is_black_friday_window",
         "is_double_day_sale",
         "is_1111_1212",
@@ -124,6 +145,23 @@ def _activity_fill_values(train: pd.DataFrame) -> Dict[str, float]:
         "promo_flag",
         "avg_promo_discount_value",
         "stackable_promo_count",
+        "promo_projected_flag",
+        "expected_orders_per_1000_sessions",
+        "orders_per_session_lag_14d",
+        "revenue_per_session_lag_28d",
+        "funnel_efficiency_lag_28d",
+        "expected_cod_order_share",
+        "expected_stockout_rate",
+        "expected_fill_rate",
+        "expected_top_product_revenue_share",
+        "expected_streetwear_concentration_risk",
+        "streetwear_concentration_risk",
+        "expected_promo_order_share",
+        "expected_promo_discount_rate",
+        "expected_lost_sales_index",
+        "promo_margin_pressure",
+        "is_operational_crisis",
+        "internal_stress_regime",
         "revenue_shock_7d",
         "cogs_shock_7d",
     }
@@ -158,6 +196,16 @@ def requested_direct_blend_weight(default: float = DIRECT_BLEND_WEIGHT) -> float
         return float(np.clip(float(raw), 0.0, 1.0))
     except ValueError:
         return default
+
+
+def _direct_blend_by_horizon(dates: pd.Series, train_end_date: pd.Timestamp, blend: float) -> np.ndarray:
+    base = float(np.clip(blend, 0.0, 1.0))
+    if base <= 0.0:
+        return np.zeros(len(dates), dtype=float)
+    horizon_days = (pd.to_datetime(dates) - pd.Timestamp(train_end_date)).dt.days.astype(float).clip(lower=0.0)
+    decay_span = max(DIRECT_BLEND_DECAY_END_DAYS - DIRECT_BLEND_DECAY_START_DAYS, 1.0)
+    decay = 1.0 - ((horizon_days - DIRECT_BLEND_DECAY_START_DAYS) / decay_span).clip(lower=0.0, upper=1.0)
+    return (base * decay).to_numpy(dtype=float)
 
 
 def fit_direct_daily_model(
@@ -226,7 +274,8 @@ def blend_direct_daily_forecast(
         )[f"{output_col}_direct_pred"].to_numpy(dtype=float)
         base = out[output_col].astype(float).to_numpy()
         direct_pred = np.clip(direct_pred, base * 0.45, base * 1.90)
-        blended = (1.0 - blend) * base + blend * direct_pred
+        effective_blend = _direct_blend_by_horizon(output_dates["date"], train_end_date, blend)
+        blended = (1.0 - effective_blend) * base + effective_blend * direct_pred
         ratio = np.divide(blended, np.maximum(base, 1e-9))
         out[output_col] = blended
         for suffix in ["p10", "p90", "p05", "p95"]:

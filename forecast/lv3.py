@@ -7,19 +7,21 @@ import numpy as np
 import pandas as pd
 
 from .common import EPS, covid_regime_flag_frame, safe_div
+from .intervals import split_conformal_abs_quantile
 from .lv1 import RidgeLogModel
 
 
 LV3_MULTIPLIER_MIN = 0.05
 LV3_MULTIPLIER_MAX = 4.00
 LV3_INTERVAL_SCALE = 1.40
-LV3_INTERVAL_HORIZON_DAILY_SLOPE = 0.015
+LV3_INTERVAL_HORIZON_DAILY_SLOPE = 0.001
 LV3_INTERVAL_VALIDATION_DAYS = 91
 TARGET_HISTORY_LAGS = [7, 14, 28]
 TARGET_HISTORY_WINDOWS = [7, 28]
 LV3_STRONG_EVENT_COLUMNS = [
     "is_1111_1212",
     "is_tet_window",
+    "is_hung_kings_day",
     "is_black_friday_window",
     "is_double_day_sale",
 ]
@@ -32,6 +34,11 @@ PLANNED_PROMO_COLUMNS = {
     "promo_flag",
     "avg_promo_discount_value",
     "stackable_promo_count",
+    "promo_seg_code",
+    "promo_discount_value",
+    "promo_type_fixed",
+    "promo_impact_score",
+    "promo_projected_flag",
 }
 
 SPIKE_ACTIVITY_COLUMNS = [
@@ -39,6 +46,18 @@ SPIKE_ACTIVITY_COLUMNS = [
     "promo_flag",
     "avg_promo_discount_value",
     "stackable_promo_count",
+    "promo_seg_code",
+    "promo_discount_value",
+    "promo_type_fixed",
+    "promo_impact_score",
+    "promo_projected_flag",
+    "orders_per_session_lag_14d",
+    "revenue_per_session_lag_28d",
+    "funnel_efficiency_lag_28d",
+    "streetwear_concentration_risk",
+    "promo_margin_pressure",
+    "is_operational_crisis",
+    "internal_stress_regime",
     "revenue_lag_7d",
     "revenue_lag_14d",
     "revenue_lag_28d",
@@ -202,19 +221,11 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
         flag_frame = covid_regime_flag_frame(df["week_id"].astype(str), week_start)
         for col in [
             "pre_covid",
-            "covid_drop",
-            "recovery_phase",
-            "normalization_phase",
-            "recovery_progress",
         ]:
             features[col] = flag_frame[col].astype(float)
     else:
         for col in [
             "pre_covid",
-            "covid_drop",
-            "recovery_phase",
-            "normalization_phase",
-            "recovery_progress",
         ]:
             features[col] = 0.0
     if "week_id" in df.columns:
@@ -254,6 +265,8 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
     is_payday_window = _numeric_feature(df, "is_payday_window")
     is_holiday = _numeric_feature(df, "is_holiday")
     is_tet_window = _numeric_feature(df, "is_tet_window")
+    is_hung_kings_day = _numeric_feature(df, "is_hung_kings_day")
+    is_lunar_holiday = _numeric_feature(df, "is_lunar_holiday")
     is_black_friday_window = _numeric_feature(df, "is_black_friday_window")
     is_double_day_sale = (
         _numeric_feature(df, "is_double_day_sale")
@@ -282,6 +295,8 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
             "is_month_start": _numeric_feature(df, "is_month_start"),
             "is_month_end": _numeric_feature(df, "is_month_end"),
             "is_tet_window": is_tet_window,
+            "is_hung_kings_day": is_hung_kings_day,
+            "is_lunar_holiday": is_lunar_holiday,
             "is_black_friday_window": is_black_friday_window,
             "is_double_day_sale": is_double_day_sale,
             "is_1111_1212": is_1111_1212,
@@ -301,6 +316,7 @@ def spike_features(df: pd.DataFrame) -> pd.DataFrame:
     event_intensity = (
         is_holiday
         + is_tet_window
+        + is_hung_kings_day
         + is_black_friday_window
         + is_double_day_sale
         + is_1111_1212
@@ -346,16 +362,16 @@ class SpikeMultiplierModel:
             residual = y.to_numpy() - pred
             residual = residual[np.isfinite(residual)]
             if len(residual):
-                self.abs_log_residual_q80 = float(np.quantile(np.abs(residual), 0.80))
-                self.abs_log_residual_q90 = float(np.quantile(np.abs(residual), 0.90))
+                self.abs_log_residual_q80 = split_conformal_abs_quantile(residual, 0.80, self.abs_log_residual_q80)
+                self.abs_log_residual_q90 = split_conformal_abs_quantile(residual, 0.90, self.abs_log_residual_q90)
         return self
 
     def set_interval_residuals(self, residual: pd.Series | np.ndarray) -> None:
         residual_values = np.asarray(residual, dtype=float)
         residual_values = residual_values[np.isfinite(residual_values)]
         if len(residual_values):
-            self.abs_log_residual_q80 = float(np.quantile(np.abs(residual_values), 0.80))
-            self.abs_log_residual_q90 = float(np.quantile(np.abs(residual_values), 0.90))
+            self.abs_log_residual_q80 = split_conformal_abs_quantile(residual_values, 0.80, self.abs_log_residual_q80)
+            self.abs_log_residual_q90 = split_conformal_abs_quantile(residual_values, 0.90, self.abs_log_residual_q90)
 
     def predict_multiplier(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:

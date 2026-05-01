@@ -6,7 +6,7 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
-from .common import EPS, FINAL_TRAIN_END_WEEK_ID, FINAL_TRAIN_START_WEEK_ID, add_calendar_columns, covid_regime_flag_frame
+from .common import EPS, FINAL_TRAIN_END_WEEK_ID, FINAL_TRAIN_START_WEEK_ID, add_calendar_columns, covid_regime_flag_frame, safe_div
 from .direct import blend_direct_daily_forecast
 from .lv1 import forecast_weekly_base_recursive, historical_weekly_base
 from .lv2 import allocate_base_daily_dynamic, daily_seasonal_shim, fit_allocation_model, lv2_columns
@@ -14,12 +14,16 @@ from .lv3 import apply_spike_multiplier, fit_spike_multiplier_model
 
 
 WEEKLY_RECONCILIATION_ANCHOR_WEIGHT = 0.05
-WEEKLY_POST_LV3_MAX_DRIFT: float | None = 0.10
+WEEKLY_POST_LV3_MAX_DRIFT: float | None = None
 CONTROLLED_RECOVERY_REVENUE_TOTAL: float | None = None
 HIGH_BUCKET_Q75_MULTIPLIER = 1.0
 HIGH_BUCKET_Q90_MULTIPLIER = 1.0
 SAMPLE_SUBMISSION_TOTAL_CALIBRATION = False
 SAMPLE_SUBMISSION_ANCHOR_WEIGHT = 0.0
+CAPACITY_TREND_FLOOR_ENABLED = False
+CAPACITY_TREND_LOOKBACK_YEARS = 2
+CAPACITY_TREND_MAX_ANNUAL_GROWTH = 0.08
+CAPACITY_TREND_MAX_SCALE = 1.20
 
 
 def _safe_div_series(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -29,14 +33,7 @@ def _safe_div_series(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 def requested_weekly_drift_cap() -> float | None:
-    raw = os.environ.get("FORECAST_WEEKLY_DRIFT_CAP", "").strip()
-    if not raw:
-        return WEEKLY_POST_LV3_MAX_DRIFT
-    try:
-        value = float(raw)
-    except ValueError:
-        return WEEKLY_POST_LV3_MAX_DRIFT
-    return float(np.clip(value, 0.0, 1.0))
+    return None
 
 
 def requested_controlled_recovery_total() -> float | None:
@@ -58,6 +55,95 @@ def requested_sample_submission_total_calibration() -> bool:
 
 def requested_sample_submission_anchor_weight() -> float:
     return 0.0
+
+
+def requested_full_model_for_partial_weeks() -> bool:
+    raw = os.environ.get("FORECAST_FULL_MODEL_PARTIAL_WEEKS", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def requested_capacity_trend_floor() -> bool:
+    default = "1" if CAPACITY_TREND_FLOOR_ENABLED else "0"
+    raw = os.environ.get("FORECAST_CAPACITY_TREND_FLOOR", default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _cagr(start: float, end: float, periods: int) -> float:
+    if periods <= 0 or start <= EPS or end <= EPS:
+        return np.nan
+    return float((end / start) ** (1.0 / periods) - 1.0)
+
+
+def _capacity_annual_growth(daily: pd.DataFrame, target_col: str, last_year: int) -> float:
+    start_year = int(last_year - CAPACITY_TREND_LOOKBACK_YEARS)
+    hist = daily[pd.to_datetime(daily["date"]).dt.year.between(start_year, last_year)].copy()
+    if hist.empty:
+        return 0.0
+    hist["year"] = pd.to_datetime(hist["date"]).dt.year
+    annual = hist.groupby("year").agg(
+        revenue=("revenue", "sum"),
+        cogs=("cogs", "sum"),
+        orders=("orders_count", "sum"),
+        avg_stock_on_hand=("stock_on_hand", "mean"),
+    )
+    if start_year not in annual.index or last_year not in annual.index:
+        return 0.0
+    periods = int(last_year - start_year)
+    candidates = [
+        _cagr(float(annual.loc[start_year, target_col]), float(annual.loc[last_year, target_col]), periods),
+    ]
+    if target_col == "revenue":
+        start_aov = safe_div(float(annual.loc[start_year, "revenue"]), float(annual.loc[start_year, "orders"]))
+        end_aov = safe_div(float(annual.loc[last_year, "revenue"]), float(annual.loc[last_year, "orders"]))
+        candidates.append(_cagr(float(start_aov), float(end_aov), periods))
+        candidates.append(_cagr(float(annual.loc[start_year, "cogs"]), float(annual.loc[last_year, "cogs"]), periods))
+    candidates.append(
+        _cagr(float(annual.loc[start_year, "avg_stock_on_hand"]), float(annual.loc[last_year, "avg_stock_on_hand"]), periods)
+    )
+    positive = [val for val in candidates if np.isfinite(val) and val > 0.0]
+    if not positive:
+        return 0.0
+    return float(np.clip(max(positive), 0.0, CAPACITY_TREND_MAX_ANNUAL_GROWTH))
+
+
+def apply_capacity_trend_floor(
+    submission: pd.DataFrame,
+    interval: pd.DataFrame,
+    daily: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not requested_capacity_trend_floor() or submission.empty:
+        return submission, interval
+    out = submission.copy()
+    interval_out = interval.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    interval_out["date"] = pd.to_datetime(interval_out["date"])
+    hist = daily[daily["revenue"].notna() & pd.to_datetime(daily["date"]).lt(out["date"].min())].copy()
+    if hist.empty:
+        return out, interval_out
+    hist["year"] = pd.to_datetime(hist["date"]).dt.year
+    last_year = int(hist["year"].max())
+    last_year_hist = hist[hist["year"].eq(last_year)]
+    if last_year_hist.empty:
+        return out, interval_out
+
+    for target, source_col in [("Revenue", "revenue"), ("COGS", "cogs")]:
+        base_daily = float(last_year_hist[source_col].mean())
+        if not np.isfinite(base_daily) or base_daily <= EPS:
+            continue
+        annual_growth = _capacity_annual_growth(hist, source_col, last_year)
+        for year, idx in out.groupby(out["date"].dt.year).groups.items():
+            years_ahead = max(int(year) - last_year, 0)
+            current_daily = float(out.loc[idx, target].mean())
+            floor_daily = base_daily * ((1.0 + annual_growth) ** years_ahead)
+            if current_daily <= EPS or floor_daily <= current_daily:
+                continue
+            scale = float(np.clip(floor_daily / current_daily, 1.0, CAPACITY_TREND_MAX_SCALE))
+            out.loc[idx, target] = out.loc[idx, target].astype(float) * scale
+            interval_idx = interval_out["date"].dt.year.eq(int(year))
+            for col in [target, f"{target}_p10", f"{target}_p90", f"{target}_p05", f"{target}_p95"]:
+                if col in interval_out.columns:
+                    interval_out.loc[interval_idx, col] = interval_out.loc[interval_idx, col].astype(float) * scale
+    return out, interval_out
 
 
 def apply_controlled_recovery_total(
@@ -349,7 +435,6 @@ def apply_recovery_weekly_guardrail(daily_pred: pd.DataFrame, weekly_base: pd.Da
     week_info = weekly_base[keep_cols].drop_duplicates("week_id").copy()
     regime = covid_regime_flag_frame(week_info["week_id"].astype(str), pd.to_datetime(week_info["week_start"]))
     week_info["recovery_phase"] = regime["recovery_phase"].to_numpy()
-    week_info["normalization_phase"] = regime["normalization_phase"].to_numpy()
     weekly_sums = out.groupby("week_id", as_index=False).agg(
         Revenue_sum=("Revenue", "sum"),
         COGS_sum=("COGS", "sum"),
@@ -363,11 +448,9 @@ def apply_recovery_weekly_guardrail(daily_pred: pd.DataFrame, weekly_base: pd.Da
         scale_col = f"{target}_recovery_guardrail_scale"
         baseline = scales[baseline_col].replace([np.inf, -np.inf], np.nan).astype(float)
         current = scales[sum_col].replace([np.inf, -np.inf], np.nan).astype(float)
-        normalization_mask = scales["normalization_phase"].fillna(0).gt(0) & baseline.gt(EPS) & current.lt(baseline * 0.85)
-        recovery_mask = scales["recovery_phase"].fillna(0).gt(0) & baseline.gt(EPS) & current.lt(baseline * 0.85)
+        recovery_mask = scales["recovery_phase"].fillna(0).gt(0) & baseline.gt(EPS) & current.lt(baseline * 0.65)
         adjusted = current.copy()
-        adjusted = adjusted.mask(recovery_mask, 0.85 * current + 0.15 * baseline)
-        adjusted = adjusted.mask(normalization_mask, 0.70 * current + 0.30 * baseline)
+        adjusted = adjusted.mask(recovery_mask, 0.95 * current + 0.05 * baseline)
         scales[scale_col] = _safe_div_series(adjusted, current).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=1.0)
         scale_cols.append(scale_col)
     if not scale_cols:
@@ -382,6 +465,33 @@ def apply_recovery_weekly_guardrail(daily_pred: pd.DataFrame, weekly_base: pd.Da
             if col in out.columns:
                 out[col] = out[col].astype(float).to_numpy() * scale
     return out.drop(columns=scale_cols)
+
+
+def align_weekly_pred_to_submission(submission: pd.DataFrame, weekly_pred: pd.DataFrame) -> pd.DataFrame:
+    if submission.empty or weekly_pred.empty or "week_id" not in submission.columns:
+        return weekly_pred
+    weekly_out = weekly_pred.copy()
+    for col in ["revenue_w_pred", "cogs_w_pred"]:
+        if col in weekly_out.columns and f"{col}_full_week" not in weekly_out.columns:
+            weekly_out[f"{col}_full_week"] = weekly_out[col]
+    sample_sums = submission.groupby("week_id", as_index=False).agg(
+        sample_days=("date", "count"),
+        revenue_w_pred=("Revenue", "sum"),
+        cogs_w_pred=("COGS", "sum"),
+    )
+    sample_sums["complete_sample_week"] = sample_sums["sample_days"].eq(7).astype(float)
+    weekly_out = weekly_out.drop(
+        columns=["sample_days", "complete_sample_week", "revenue_w_pred", "cogs_w_pred"],
+        errors="ignore",
+    )
+    weekly_out = weekly_out.merge(sample_sums, on="week_id", how="left")
+    for col in ["revenue_w_pred", "cogs_w_pred"]:
+        full_col = f"{col}_full_week"
+        if full_col in weekly_out.columns:
+            weekly_out[col] = weekly_out[col].fillna(weekly_out[full_col])
+    weekly_out["sample_days"] = weekly_out["sample_days"].fillna(0).astype(int)
+    weekly_out["complete_sample_week"] = weekly_out["complete_sample_week"].fillna(0.0)
+    return weekly_out
 
 
 def cap_weekly_drift_to_base(
@@ -528,9 +638,8 @@ def forecast_daily_base_spikes(
     )
     daily_pred = blend_direct_daily_forecast(daily, daily_pred, train_start_date, train_end_date)
     daily_pred = reconcile_daily_to_weekly_anchor(daily_pred, weekly_base)
-    daily_pred = apply_recovery_weekly_guardrail(daily_pred, weekly_base)
     daily_pred = apply_high_bucket_correction(daily_pred, forecast_daily)
-    daily_pred = cap_weekly_drift_to_base(daily_pred, weekly_base, requested_weekly_drift_cap())
+    daily_pred, _ = apply_capacity_trend_floor(daily_pred, daily_pred, daily)
 
     weekly_bottom_up = daily_pred.groupby("week_id", as_index=False).agg(
         revenue_w_pred=("Revenue", "sum"),
@@ -557,23 +666,27 @@ def final_forecast(daily: pd.DataFrame, weekly: pd.DataFrame, sample: pd.DataFra
     submission["Revenue"] = daily_seasonal_shim(sales_daily, submission["date"], "revenue")
     submission["COGS"] = daily_seasonal_shim(sales_daily, submission["date"], "cogs")
 
-    counts = submission.groupby("week_id")["date"].transform("count")
-    complete_week_ids = submission.loc[counts.eq(7), "week_id"].drop_duplicates().tolist()
-    future_daily_features = daily[daily["date"].isin(sample_dates["date"])].copy()
-    complete_future_daily = future_daily_features[future_daily_features["week_id"].isin(complete_week_ids)].copy()
+    sample_week_ids = sample_dates["week_id"].drop_duplicates().tolist()
+    future_daily_features = daily[daily["week_id"].isin(sample_week_ids)].copy()
+    if not requested_full_model_for_partial_weeks():
+        counts = future_daily_features.groupby("week_id")["date"].transform("count")
+        forecast_daily = future_daily_features[counts.eq(7)].copy()
+    else:
+        forecast_daily = future_daily_features.copy()
 
     daily_pred, weekly_pred = forecast_daily_base_spikes(
         daily,
         weekly,
-        complete_future_daily,
+        forecast_daily,
         FINAL_TRAIN_END_WEEK_ID,
         FINAL_TRAIN_START_WEEK_ID,
     )
 
     submission = submission.set_index("date")
     daily_pred_idx = daily_pred.set_index("date")
-    submission.loc[daily_pred_idx.index, "Revenue"] = daily_pred_idx["Revenue"]
-    submission.loc[daily_pred_idx.index, "COGS"] = daily_pred_idx["COGS"]
+    sample_pred_dates = submission.index.intersection(daily_pred_idx.index)
+    submission.loc[sample_pred_dates, "Revenue"] = daily_pred_idx.loc[sample_pred_dates, "Revenue"]
+    submission.loc[sample_pred_dates, "COGS"] = daily_pred_idx.loc[sample_pred_dates, "COGS"]
     submission = submission.reset_index()
 
     interval = submission[["date", "Revenue", "COGS"]].copy()
@@ -631,6 +744,7 @@ def final_forecast(daily: pd.DataFrame, weekly: pd.DataFrame, sample: pd.DataFra
         weekly_pred,
         sample,
     )
+    weekly_pred = align_weekly_pred_to_submission(submission, weekly_pred)
 
     out = submission[["date", "Revenue", "COGS"]].rename(columns={"date": "Date"})
     out["Revenue"] = out["Revenue"].clip(lower=0).round(2)
@@ -662,12 +776,12 @@ def coherence_summary(submission: pd.DataFrame, weekly_pred: pd.DataFrame) -> pd
     daily = submission.copy()
     daily["Date"] = pd.to_datetime(daily["Date"])
     daily = add_calendar_columns(daily.rename(columns={"Date": "date"}), "date")
-    counts = daily.groupby("week_id")["date"].transform("count")
-    daily = daily[counts.eq(7)].copy()
     summary = daily.groupby("week_id", as_index=False).agg(
         Revenue=("Revenue", "sum"),
         COGS=("COGS", "sum"),
+        sample_days=("date", "count"),
     )
+    summary["complete_sample_week"] = summary["sample_days"].eq(7).astype(float)
     keep_cols = [
         "week_id",
         "revenue_w_base",

@@ -36,6 +36,8 @@ LV2_FEATURE_COLUMNS = [
     "is_month_end",
     "is_holiday",
     "is_tet_window",
+    "is_hung_kings_day",
+    "is_lunar_holiday",
     "is_black_friday_window",
     "is_double_day_sale",
     "is_1111_1212",
@@ -46,10 +48,25 @@ LV2_FEATURE_COLUMNS = [
     "stackable_promo_count",
     "promo_start_day",
     "promo_end_day",
-    "promo_intensity_day",
     "days_to_promo",
     "days_since_promo_start",
     "days_until_promo_end",
+    "expected_orders_per_1000_sessions",
+    "orders_per_session_lag_14d",
+    "revenue_per_session_lag_28d",
+    "funnel_efficiency_lag_28d",
+    "expected_cod_order_share",
+    "expected_stockout_rate",
+    "expected_fill_rate",
+    "expected_top_product_revenue_share",
+    "expected_streetwear_concentration_risk",
+    "streetwear_concentration_risk",
+    "expected_promo_order_share",
+    "expected_promo_discount_rate",
+    "expected_lost_sales_index",
+    "promo_margin_pressure",
+    "is_operational_crisis",
+    "internal_stress_regime",
 ]
 
 
@@ -293,10 +310,7 @@ def _attach_historical_weight_features(df: pd.DataFrame, model: AllocationModel)
     out["hist_weight_month_weekday"] = out["hist_weight_month_weekday"].fillna(out["hist_weight_weekday"])
     out["hist_weight_day_of_month"] = out["hist_weight_day_of_month"].fillna(out["hist_weight_weekday"])
     out["hist_weight_weekday_regime"] = out["hist_weight_weekday_regime"].fillna(out["hist_weight_weekday"])
-    recovery_prior = (
-        (1.0 - out["recovery_progress"].clip(0.0, 1.0)) * out["hist_weight_weekday_covid"]
-        + out["recovery_progress"].clip(0.0, 1.0) * out["hist_weight_weekday_precovid"]
-    )
+    recovery_prior = out["hist_weight_weekday_covid"]
     recovery_like = out["recovery_phase"].gt(0) | out["normalization_phase"].gt(0)
     out["hist_weight_weekday_regime"] = np.where(recovery_like, recovery_prior, out["hist_weight_weekday_regime"])
     out["hist_weight_blend"] = (
@@ -359,16 +373,10 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["week_position_in_month"] = df.get("week_position_in_month", np.ceil(day_of_month / 7.0)).astype(float)
     for col in [
         "pre_covid",
-        "covid_drop",
-        "recovery_phase",
-        "normalization_phase",
-        "weeks_since_covid_start",
-        "weeks_since_recovery_start",
-        "recovery_progress",
+        "is_operational_crisis",
+        "internal_stress_regime",
     ]:
         out[col] = df[col].fillna(0).astype(float) if col in df.columns else 0.0
-    out["recovery_progress_x_month_sin"] = out["recovery_progress"] * np.sin(2 * np.pi * month / 12.0)
-    out["recovery_progress_x_month_cos"] = out["recovery_progress"] * np.cos(2 * np.pi * month / 12.0)
     for col in [
         "is_weekend",
         "is_payday_window",
@@ -376,6 +384,8 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         "is_month_end",
         "is_holiday",
         "is_tet_window",
+        "is_hung_kings_day",
+        "is_lunar_holiday",
         "is_black_friday_window",
         "is_double_day_sale",
         "is_1111_1212",
@@ -389,7 +399,6 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         "active_promo_count",
         "avg_promo_discount_value",
         "stackable_promo_count",
-        "promo_intensity_day",
         "days_to_promo",
         "days_since_promo_start",
         "days_until_promo_end",
@@ -408,6 +417,22 @@ def _allocation_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         "weekly_trend_1w",
         "weekly_vs_ma4",
         "weekly_volatility_4w",
+        "expected_orders_per_1000_sessions",
+        "orders_per_session_lag_14d",
+        "revenue_per_session_lag_28d",
+        "funnel_efficiency_lag_28d",
+        "expected_cod_order_share",
+        "expected_stockout_rate",
+        "expected_fill_rate",
+        "expected_top_product_revenue_share",
+        "expected_streetwear_concentration_risk",
+        "streetwear_concentration_risk",
+        "expected_promo_order_share",
+        "expected_promo_discount_rate",
+        "expected_lost_sales_index",
+        "promo_margin_pressure",
+        "is_operational_crisis",
+        "internal_stress_regime",
     ]:
         raw = df[col] if col in df.columns else pd.Series(0.0, index=df.index)
         raw = raw.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
