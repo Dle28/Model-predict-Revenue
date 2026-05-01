@@ -121,18 +121,28 @@ def clean_generated_files(cfg: Config, clean_outputs: bool, clean_artifacts: boo
 
 def calibrated_best650_submission(cfg: Config) -> pd.DataFrame:
     base_path = cfg.output_dir / BEST650_BASE_SUBMISSION
-    if not base_path.exists():
-        raise FileNotFoundError(
-            f"Missing canonical base submission: {base_path}. "
-            "Keep outputs/submission_best_650k.csv to reproduce the best650 submission."
-        )
-    submission = pd.read_csv(base_path)
     expected = ["Date", "Revenue", "COGS"]
-    if list(submission.columns) != expected:
-        raise ValueError(f"{base_path} columns must be {expected}, got {list(submission.columns)}")
-    submission["Revenue"] = (pd.to_numeric(submission["Revenue"], errors="raise") * BEST650_REVENUE_SCALE).round(2)
-    submission["COGS"] = (pd.to_numeric(submission["COGS"], errors="raise") * BEST650_COGS_SCALE).round(2)
-    return submission
+    if base_path.exists():
+        submission = pd.read_csv(base_path)
+        if list(submission.columns) != expected:
+            raise ValueError(f"{base_path} columns must be {expected}, got {list(submission.columns)}")
+        submission["Revenue"] = (pd.to_numeric(submission["Revenue"], errors="raise") * BEST650_REVENUE_SCALE).round(2)
+        submission["COGS"] = (pd.to_numeric(submission["COGS"], errors="raise") * BEST650_COGS_SCALE).round(2)
+        return submission
+
+    variant_path = cfg.output_dir / BEST650_VARIANT_SUBMISSION
+    if variant_path.exists():
+        submission = pd.read_csv(variant_path)
+        if list(submission.columns) != expected:
+            raise ValueError(f"{variant_path} columns must be {expected}, got {list(submission.columns)}")
+        for col in ["Revenue", "COGS"]:
+            submission[col] = pd.to_numeric(submission[col], errors="raise").round(2)
+        return submission
+
+    raise FileNotFoundError(
+        f"Missing canonical best650 files: {base_path} and {variant_path}. "
+        "Keep either the unscaled base or the final canonical variant to reproduce the best650 submission."
+    )
 
 
 def align_intervals_to_submission(intervals: pd.DataFrame, submission: pd.DataFrame) -> pd.DataFrame:

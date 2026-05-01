@@ -1,0 +1,2 @@
+train_days,revenue_median,revenue_p01,revenue_p99,revenue_max,high_residual_days_z35,low_residual_days_z35,top_1pct_days,bottom_1pct_days
+3833,3647303.9,845078.752,13801990.053599996,20905271.35,91,0,39,39

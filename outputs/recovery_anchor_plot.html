@@ -1,0 +1,263 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Recovery Anchor Diagnostic</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --ink: #17202a;
+      --muted: #667085;
+      --grid: #e5e7eb;
+      --panel: #fff;
+      --forecast: #2563eb;
+      --baseline: #dc2626;
+      --anchor: #059669;
+      --final: #7c3aed;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1240px; margin: 0 auto; padding: 24px; }
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0; }
+    .subtle { color: var(--muted); }
+    .controls {
+      display: inline-flex;
+      padding: 4px;
+      border: 1px solid var(--grid);
+      border-radius: 8px;
+      background: var(--panel);
+      gap: 4px;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button.active { background: #111827; color: #fff; }
+    .chart-panel {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--grid);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    canvas { display: block; width: 100%; height: 560px; }
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin: 10px 4px 0;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 22px; height: 3px; border-radius: 999px; display: inline-block; }
+    .forecast { background: var(--forecast); }
+    .final { background: var(--final); }
+    .baseline { background: var(--baseline); }
+    .anchor { background: var(--anchor); }
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(17, 24, 39, 0.94);
+      color: #fff;
+      border-radius: 8px;
+      padding: 9px 10px;
+      font-size: 12px;
+      min-width: 210px;
+      transform: translate(-50%, -110%);
+      display: none;
+      z-index: 2;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Recovery Anchor Diagnostic</h1>
+        <div class="subtle">Weekly forecast versus pre-COVID baseline and recovery anchor</div>
+      </div>
+      <div class="controls" aria-label="Metric selector">
+        <button id="revenueBtn" class="active" type="button">Revenue</button>
+        <button id="cogsBtn" type="button">COGS</button>
+      </div>
+    </header>
+    <section class="chart-panel">
+      <canvas id="chart"></canvas>
+      <div class="tooltip" id="tooltip"></div>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch forecast"></span>LV1 base</span>
+        <span class="legend-item"><span class="swatch final"></span>Final weekly sum</span>
+        <span class="legend-item"><span class="swatch baseline"></span>Pre-COVID baseline</span>
+        <span class="legend-item"><span class="swatch anchor"></span>Recovery anchor</span>
+      </div>
+    </section>
+  </main>
+  <script>
+    const DATA = [{"weekId":"2022-W52","weekStart":"2022-12-26","revenueBase":20826724.23,"revenueFinal":3388087.77,"revenueBaseline":27742405.03,"revenueAnchor":24260959.0,"revenueProgress":0.8,"cogsBase":21048561.66,"cogsFinal":3058460.37,"cogsBaseline":27432090.71,"cogsAnchor":24060742.2,"cogsProgress":0.8},{"weekId":"2023-W01","weekStart":"2023-01-02","revenueBase":13609001.01,"revenueFinal":9020541.09,"revenueBaseline":18330504.23,"revenueAnchor":17352884.01,"revenueProgress":0.8,"cogsBase":11183077.73,"cogsFinal":8051957.21,"cogsBaseline":14807263.13,"cogsAnchor":14567880.64,"cogsProgress":0.8},{"weekId":"2023-W02","weekStart":"2023-01-09","revenueBase":15005099.6,"revenueFinal":13564924.19,"revenueBaseline":18899086.76,"revenueAnchor":18064606.46,"revenueProgress":0.81,"cogsBase":12392562.37,"cogsFinal":12102690.06,"cogsBaseline":15259819.92,"cogsAnchor":15034943.28,"cogsProgress":0.81},{"weekId":"2023-W03","weekStart":"2023-01-16","revenueBase":15996710.89,"revenueFinal":14787074.99,"revenueBaseline":20770764.46,"revenueAnchor":19764984.26,"revenueProgress":0.82,"cogsBase":13253920.68,"cogsFinal":13182661.47,"cogsBaseline":16751009.99,"cogsAnchor":16268242.01,"cogsProgress":0.82},{"weekId":"2023-W04","weekStart":"2023-01-23","revenueBase":20938762.94,"revenueFinal":20742132.37,"revenueBaseline":26494358.4,"revenueAnchor":24677257.61,"revenueProgress":0.82,"cogsBase":17095501.04,"cogsFinal":18494127.86,"cogsBaseline":21494730.58,"cogsAnchor":20235181.63,"cogsProgress":0.82},{"weekId":"2023-W05","weekStart":"2023-01-30","revenueBase":20605883.97,"revenueFinal":19785653.8,"revenueBaseline":27681072.94,"revenueAnchor":25718525.74,"revenueProgress":0.83,"cogsBase":16721200.03,"cogsFinal":17653118.74,"cogsBaseline":22368004.43,"cogsAnchor":20823720.75,"cogsProgress":0.83},{"weekId":"2023-W06","weekStart":"2023-02-06","revenueBase":18318538.11,"revenueFinal":16545367.27,"revenueBaseline":23201653.58,"revenueAnchor":22348561.78,"revenueProgress":0.83,"cogsBase":14902606.45,"cogsFinal":14760999.28,"cogsBaseline":18814126.72,"cogsAnchor":18149119.33,"cogsProgress":0.83},{"weekId":"2023-W07","weekStart":"2023-02-13","revenueBase":22049137.86,"revenueFinal":21713969.88,"revenueBaseline":27599472.51,"revenueAnchor":26189929.38,"revenueProgress":0.84,"cogsBase":17927158.1,"cogsFinal":19379900.5,"cogsBaseline":22384568.45,"cogsAnchor":21259600.95,"cogsProgress":0.84},{"weekId":"2023-W08","weekStart":"2023-02-20","revenueBase":29197948.54,"revenueFinal":29004426.05,"revenueBaseline":35015547.7,"revenueAnchor":32715386.41,"revenueProgress":0.84,"cogsBase":23724407.82,"cogsFinal":25888037.67,"cogsBaseline":28767073.01,"cogsAnchor":26851711.64,"cogsProgress":0.84},{"weekId":"2023-W09","weekStart":"2023-02-27","revenueBase":28437678.45,"revenueFinal":22387703.7,"revenueBaseline":35986946.46,"revenueAnchor":33925231.65,"revenueProgress":0.85,"cogsBase":22898786.28,"cogsFinal":19991719.55,"cogsBaseline":29064873.01,"cogsAnchor":27416915.95,"cogsProgress":0.85},{"weekId":"2023-W10","weekStart":"2023-03-06","revenueBase":28105185.02,"revenueFinal":26220809.44,"revenueBaseline":32848474.83,"revenueAnchor":31607707.56,"revenueProgress":0.85,"cogsBase":22809211.28,"cogsFinal":23405675.14,"cogsBaseline":26403018.75,"cogsAnchor":25430967.37,"cogsProgress":0.85},{"weekId":"2023-W11","weekStart":"2023-03-13","revenueBase":34925533.65,"revenueFinal":34445193.73,"revenueBaseline":41049615.72,"revenueAnchor":39018011.52,"revenueProgress":0.86,"cogsBase":28300278.32,"cogsFinal":30765490.75,"cogsBaseline":33884586.84,"cogsAnchor":32149383.86,"cogsProgress":0.86},{"weekId":"2023-W12","weekStart":"2023-03-20","revenueBase":35863487.27,"revenueFinal":37079444.95,"revenueBaseline":43001396.21,"revenueAnchor":41209255.21,"revenueProgress":0.86,"cogsBase":31780809.58,"cogsFinal":33258994.22,"cogsBaseline":38208694.81,"cogsAnchor":36285200.69,"cogsProgress":0.86},{"weekId":"2023-W13","weekStart":"2023-03-27","revenueBase":50763015.88,"revenueFinal":60657135.82,"revenueBaseline":62683733.88,"revenueAnchor":58508537.16,"revenueProgress":0.86,"cogsBase":46965893.8,"cogsFinal":54449898.78,"cogsBaseline":57140607.66,"cogsAnchor":52986716.3,"cogsProgress":0.86},{"weekId":"2023-W14","weekStart":"2023-04-03","revenueBase":31242303.61,"revenueFinal":28866807.67,"revenueBaseline":41813936.14,"revenueAnchor":41236830.19,"revenueProgress":0.87,"cogsBase":27245950.7,"cogsFinal":25905877.61,"cogsBaseline":37384777.48,"cogsAnchor":36739318.27,"cogsProgress":0.87},{"weekId":"2023-W15","weekStart":"2023-04-10","revenueBase":37081981.7,"revenueFinal":34483743.24,"revenueBaseline":46062654.92,"revenueAnchor":45062850.64,"revenueProgress":0.87,"cogsBase":32463168.22,"cogsFinal":30922984.56,"cogsBaseline":40100043.56,"cogsAnchor":39270252.73,"cogsProgress":0.87},{"weekId":"2023-W16","weekStart":"2023-04-17","revenueBase":40941268.63,"revenueFinal":38827480.71,"revenueBaseline":55940220.36,"revenueAnchor":53820453.58,"revenueProgress":0.88,"cogsBase":33536984.55,"cogsFinal":34658796.62,"cogsBaseline":45296709.91,"cogsAnchor":43980336.29,"cogsProgress":0.88},{"weekId":"2023-W17","weekStart":"2023-04-24","revenueBase":51124083.33,"revenueFinal":50703989.0,"revenueBaseline":67935719.66,"revenueAnchor":64600126.78,"revenueProgress":0.88,"cogsBase":41310835.65,"cogsFinal":45255106.43,"cogsBaseline":54469488.73,"cogsAnchor":52150519.76,"cogsProgress":0.88},{"weekId":"2023-W18","weekStart":"2023-05-01","revenueBase":41612701.9,"revenueFinal":34829629.22,"revenueBaseline":60285231.83,"revenueAnchor":57948321.75,"revenueProgress":0.88,"cogsBase":33017785.43,"cogsFinal":31053145.43,"cogsBaseline":48059206.98,"cogsAnchor":46389974.04,"cogsProgress":0.88},{"weekId":"2023-W19","weekStart":"2023-05-08","revenueBase":40640321.28,"revenueFinal":33186508.6,"revenueBaseline":52987627.57,"revenueAnchor":51832266.77,"revenueProgress":0.89,"cogsBase":31897335.24,"cogsFinal":29583490.91,"cogsBaseline":42590482.7,"cogsAnchor":41748075.99,"cogsProgress":0.89},{"weekId":"2023-W20","weekStart":"2023-05-15","revenueBase":43635012.84,"revenueFinal":38711347.43,"revenueBaseline":57074538.11,"revenueAnchor":55607031.0,"revenueProgress":0.89,"cogsBase":34388175.67,"cogsFinal":34513536.98,"cogsBaseline":45499336.54,"cogsAnchor":44351141.91,"cogsProgress":0.89},{"weekId":"2023-W21","weekStart":"2023-05-22","revenueBase":46901144.31,"revenueFinal":40028964.18,"revenueBaseline":62646586.51,"revenueAnchor":60707919.9,"revenueProgress":0.89,"cogsBase":37064827.73,"cogsFinal":35686016.8,"cogsBaseline":50382219.2,"cogsAnchor":48777127.48,"cogsProgress":0.89},{"weekId":"2023-W22","weekStart":"2023-05-29","revenueBase":60479833.15,"revenueFinal":60928727.61,"revenueBaseline":81736029.75,"revenueAnchor":77799050.15,"revenueProgress":0.9,"cogsBase":48970235.24,"cogsFinal":54339495.75,"cogsBaseline":65699981.5,"cogsAnchor":62471026.07,"cogsProgress":0.9},{"weekId":"2023-W23","weekStart":"2023-06-05","revenueBase":38946129.15,"revenueFinal":30282204.06,"revenueBaseline":50545406.14,"revenueAnchor":50284869.36,"revenueProgress":0.9,"cogsBase":30243122.93,"cogsFinal":27017624.32,"cogsBaseline":40441315.72,"cogsAnchor":40207528.01,"cogsProgress":0.9},{"weekId":"2023-W24","weekStart":"2023-06-12","revenueBase":44023549.0,"revenueFinal":37072222.8,"revenueBaseline":56742319.14,"revenueAnchor":55854451.88,"revenueProgress":0.9,"cogsBase":34998481.0,"cogsFinal":33078749.54,"cogsBaseline":45661337.98,"cogsAnchor":44894105.35,"cogsProgress":0.9},{"weekId":"2023-W25","weekStart":"2023-06-19","revenueBase":43393742.32,"revenueFinal":35852599.03,"revenueBaseline":57447464.7,"revenueAnchor":56530360.37,"revenueProgress":0.91,"cogsBase":34682323.17,"cogsFinal":32029811.32,"cogsBaseline":47257851.98,"cogsAnchor":46379917.49,"cogsProgress":0.91},{"weekId":"2023-W26","weekStart":"2023-06-26","revenueBase":50031327.49,"revenueFinal":43900261.43,"revenueBaseline":64577994.13,"revenueAnchor":62967218.94,"revenueProgress":0.91,"cogsBase":45861396.72,"cogsFinal":39541046.43,"cogsBaseline":59377379.22,"cogsAnchor":57380150.09,"cogsProgress":0.91},{"weekId":"2023-W27","weekStart":"2023-07-03","revenueBase":26681036.15,"revenueFinal":19626389.89,"revenueBaseline":35377083.0,"revenueAnchor":36139168.26,"revenueProgress":0.91,"cogsBase":23721666.82,"cogsFinal":17695963.9,"cogsBaseline":33111875.09,"cogsAnchor":33403236.6,"cogsProgress":0.91},{"weekId":"2023-W28","weekStart":"2023-07-10","revenueBase":29916851.41,"revenueFinal":25890234.32,"revenueBaseline":35342017.21,"revenueAnchor":35823940.63,"revenueProgress":0.92,"cogsBase":28322465.29,"cogsFinal":23318854.9,"cogsBaseline":33991658.81,"cogsAnchor":34061470.01,"cogsProgress":0.92},{"weekId":"2023-W29","weekStart":"2023-07-17","revenueBase":32828001.83,"revenueFinal":28344111.19,"revenueBaseline":40310586.52,"revenueAnchor":40080350.64,"revenueProgress":0.92,"cogsBase":29111336.04,"cogsFinal":25447127.02,"cogsBaseline":36523868.93,"cogsAnchor":36246675.61,"cogsProgress":0.92},{"weekId":"2023-W30","weekStart":"2023-07-24","revenueBase":39032922.73,"revenueFinal":31861161.4,"revenueBaseline":52573969.58,"revenueAnchor":51164997.3,"revenueProgress":0.92,"cogsBase":32005252.06,"cogsFinal":28486562.4,"cogsBaseline":44453300.1,"cogsAnchor":43442967.22,"cogsProgress":0.92},{"weekId":"2023-W31","weekStart":"2023-07-31","revenueBase":37843245.06,"revenueFinal":30554199.01,"revenueBaseline":52506154.2,"revenueAnchor":50933734.33,"revenueProgress":0.92,"cogsBase":34484254.72,"cogsFinal":27643089.18,"cogsBaseline":48001765.89,"cogsAnchor":46481771.61,"cogsProgress":0.92},{"weekId":"2023-W32","weekStart":"2023-08-07","revenueBase":24708550.23,"revenueFinal":21083253.73,"revenueBaseline":31940794.33,"revenueAnchor":32162355.9,"revenueProgress":0.93,"cogsBase":22636854.12,"cogsFinal":19140836.25,"cogsBaseline":28962893.34,"cogsAnchor":29113712.18,"cogsProgress":0.93},{"weekId":"2023-W33","weekStart":"2023-08-14","revenueBase":26594563.05,"revenueFinal":22771899.75,"revenueBaseline":33258646.05,"revenueAnchor":33283604.0,"revenueProgress":0.93,"cogsBase":23718638.19,"cogsFinal":20671103.1,"cogsBaseline":29802511.84,"cogsAnchor":29784902.63,"cogsProgress":0.93},{"weekId":"2023-W34","weekStart":"2023-08-21","revenueBase":29382647.01,"revenueFinal":23629822.5,"revenueBaseline":35745765.57,"revenueAnchor":35485918.43,"revenueProgress":0.93,"cogsBase":27175893.55,"cogsFinal":21447962.31,"cogsBaseline":33926029.73,"cogsAnchor":33524789.2,"cogsProgress":0.93},{"weekId":"2023-W35","weekStart":"2023-08-28","revenueBase":39050546.19,"revenueFinal":38140837.93,"revenueBaseline":48892392.67,"revenueAnchor":47581723.6,"revenueProgress":0.93,"cogsBase":36400659.44,"cogsFinal":34529777.58,"cogsBaseline":45272151.24,"cogsAnchor":44028981.83,"cogsProgress":0.93},{"weekId":"2023-W36","weekStart":"2023-09-04","revenueBase":23445965.57,"revenueFinal":18087349.96,"revenueBaseline":28849309.62,"revenueAnchor":28920857.76,"revenueProgress":0.93,"cogsBase":21024449.81,"cogsFinal":16244745.74,"cogsBaseline":26958130.31,"cogsAnchor":26992749.97,"cogsProgress":0.93},{"weekId":"2023-W37","weekStart":"2023-09-11","revenueBase":25729609.75,"revenueFinal":22044482.79,"revenueBaseline":31837694.46,"revenueAnchor":31695821.66,"revenueProgress":0.94,"cogsBase":22274462.43,"cogsFinal":19804216.6,"cogsBaseline":28382556.95,"cogsAnchor":28299281.53,"cogsProgress":0.94},{"weekId":"2023-W38","weekStart":"2023-09-18","revenueBase":26416480.43,"revenueFinal":22251511.35,"revenueBaseline":32752962.38,"revenueAnchor":32545345.28,"revenueProgress":0.94,"cogsBase":22976329.39,"cogsFinal":19984092.42,"cogsBaseline":29158314.03,"cogsAnchor":29007163.39,"cogsProgress":0.94},{"weekId":"2023-W39","weekStart":"2023-09-25","revenueBase":31583253.83,"revenueFinal":29447465.6,"revenueBaseline":38171100.68,"revenueAnchor":37599953.75,"revenueProgress":0.94,"cogsBase":27586924.73,"cogsFinal":26428192.96,"cogsBaseline":33778066.23,"cogsAnchor":33291077.47,"cogsProgress":0.94},{"weekId":"2023-W40","weekStart":"2023-10-02","revenueBase":21405736.25,"revenueFinal":15091350.06,"revenueBaseline":26709267.78,"revenueAnchor":26714189.74,"revenueProgress":0.94,"cogsBase":17276687.0,"cogsFinal":13458044.95,"cogsBaseline":21900827.15,"cogsAnchor":21991904.46,"cogsProgress":0.94},{"weekId":"2023-W41","weekStart":"2023-10-09","revenueBase":21365113.52,"revenueFinal":17309812.07,"revenueBaseline":26784576.22,"revenueAnchor":26756322.67,"revenueProgress":0.94,"cogsBase":17053438.73,"cogsFinal":15439355.06,"cogsBaseline":21354665.39,"cogsAnchor":21420894.3,"cogsProgress":0.94},{"weekId":"2023-W42","weekStart":"2023-10-16","revenueBase":23143979.18,"revenueFinal":19837910.94,"revenueBaseline":28349219.72,"revenueAnchor":28176617.02,"revenueProgress":0.95,"cogsBase":17998510.27,"cogsFinal":17693138.25,"cogsBaseline":22342399.66,"cogsAnchor":22281209.3,"cogsProgress":0.95},{"weekId":"2023-W43","weekStart":"2023-10-23","revenueBase":26753472.88,"revenueFinal":23301589.29,"revenueBaseline":32087507.26,"revenueAnchor":31678733.95,"revenueProgress":0.95,"cogsBase":21190830.7,"cogsFinal":20782656.61,"cogsBaseline":25638295.43,"cogsAnchor":25338357.94,"cogsProgress":0.95},{"weekId":"2023-W44","weekStart":"2023-10-30","revenueBase":24252451.63,"revenueFinal":20507521.08,"revenueBaseline":30871834.68,"revenueAnchor":30476060.62,"revenueProgress":0.95,"cogsBase":19175361.73,"cogsFinal":18307312.77,"cogsBaseline":24694476.45,"cogsAnchor":24370110.86,"cogsProgress":0.95},{"weekId":"2023-W45","weekStart":"2023-11-06","revenueBase":18628582.17,"revenueFinal":14599197.48,"revenueBaseline":23839842.98,"revenueAnchor":23841780.27,"revenueProgress":0.95,"cogsBase":14680288.13,"cogsFinal":13036302.57,"cogsBaseline":19091547.7,"cogsAnchor":19079747.55,"cogsProgress":0.95},{"weekId":"2023-W46","weekStart":"2023-11-13","revenueBase":18103354.54,"revenueFinal":14952770.2,"revenueBaseline":23348800.73,"revenueAnchor":23341360.76,"revenueProgress":0.95,"cogsBase":15009931.23,"cogsFinal":13366096.28,"cogsBaseline":19595933.92,"cogsAnchor":19531528.26,"cogsProgress":0.95},{"weekId":"2023-W47","weekStart":"2023-11-20","revenueBase":17040006.68,"revenueFinal":12303334.27,"revenueBaseline":21401708.82,"revenueAnchor":21426626.17,"revenueProgress":0.95,"cogsBase":15922244.91,"cogsFinal":11092799.0,"cogsBaseline":19684640.41,"cogsAnchor":19583123.02,"cogsProgress":0.95},{"weekId":"2023-W48","weekStart":"2023-11-27","revenueBase":16746697.71,"revenueFinal":13484090.41,"revenueBaseline":22266764.0,"revenueAnchor":22141618.52,"revenueProgress":0.95,"cogsBase":16551524.12,"cogsFinal":12177700.15,"cogsBaseline":22140114.63,"cogsAnchor":21870701.51,"cogsProgress":0.95},{"weekId":"2023-W49","weekStart":"2023-12-04","revenueBase":13347819.91,"revenueFinal":9041545.71,"revenueBaseline":16362073.67,"revenueAnchor":16417767.54,"revenueProgress":0.96,"cogsBase":12974619.39,"cogsFinal":8169790.54,"cogsBaseline":16386259.08,"cogsAnchor":16349120.86,"cogsProgress":0.96},{"weekId":"2023-W50","weekStart":"2023-12-11","revenueBase":14600577.54,"revenueFinal":12572331.97,"revenueBaseline":17593410.58,"revenueAnchor":17538733.78,"revenueProgress":0.96,"cogsBase":14471790.29,"cogsFinal":11362081.42,"cogsBaseline":17495671.43,"cogsAnchor":17394272.33,"cogsProgress":0.96},{"weekId":"2023-W51","weekStart":"2023-12-18","revenueBase":16308027.04,"revenueFinal":14648489.45,"revenueBaseline":20773361.55,"revenueAnchor":20552970.51,"revenueProgress":0.96,"cogsBase":16175199.55,"cogsFinal":13234172.86,"cogsBaseline":20868339.45,"cogsAnchor":20625300.5,"cogsProgress":0.96},{"weekId":"2023-W52","weekStart":"2023-12-25","revenueBase":22762434.39,"revenueFinal":21355277.13,"revenueBaseline":27742405.03,"revenueAnchor":27242677.18,"revenueProgress":0.96,"cogsBase":22979998.59,"cogsFinal":19298088.99,"cogsBaseline":27432090.71,"cogsAnchor":26936476.06,"cogsProgress":0.96},{"weekId":"2024-W01","weekStart":"2024-01-01","revenueBase":15839044.97,"revenueFinal":10009162.71,"revenueBaseline":18330504.23,"revenueAnchor":18269404.24,"revenueProgress":0.96,"cogsBase":12939447.52,"cogsFinal":8941528.33,"cogsBaseline":14807263.13,"cogsAnchor":14878729.38,"cogsProgress":0.96},{"weekId":"2024-W02","weekStart":"2024-01-08","revenueBase":16635056.28,"revenueFinal":13712046.3,"revenueBaseline":18899086.76,"revenueAnchor":18841904.41,"revenueProgress":0.96,"cogsBase":13239561.04,"cogsFinal":12231407.65,"cogsBaseline":15259819.92,"cogsAnchor":15311749.28,"cogsProgress":0.96},{"weekId":"2024-W03","weekStart":"2024-01-15","revenueBase":18023307.66,"revenueFinal":14783223.07,"revenueBaseline":20770764.46,"revenueAnchor":20665692.04,"revenueProgress":0.96,"cogsBase":14393380.95,"cogsFinal":13181039.4,"cogsBaseline":16751009.99,"cogsAnchor":16735804.07,"cogsProgress":0.96},{"weekId":"2024-W04","weekStart":"2024-01-22","revenueBase":22599301.54,"revenueFinal":19689691.77,"revenueBaseline":26494358.4,"revenueAnchor":26205590.35,"revenueProgress":0.96,"cogsBase":18355523.93,"cogsFinal":17560940.05,"cogsBaseline":21494730.58,"cogsAnchor":21296792.21,"cogsProgress":0.96},{"weekId":"2024-W05","weekStart":"2024-01-29","revenueBase":23971839.8,"revenueFinal":23167971.91,"revenueBaseline":27681072.94,"revenueAnchor":27359186.68,"revenueProgress":0.97,"cogsBase":18781051.81,"cogsFinal":20669314.97,"cogsBaseline":22368004.43,"cogsAnchor":22106713.99,"cogsProgress":0.97},{"weekId":"2024-W06","weekStart":"2024-02-05","revenueBase":20037372.39,"revenueFinal":16235898.02,"revenueBaseline":23201653.58,"revenueAnchor":23105663.9,"revenueProgress":0.97,"cogsBase":16069946.65,"cogsFinal":14486357.54,"cogsBaseline":18814126.72,"cogsAnchor":18727175.59,"cogsProgress":0.97},{"weekId":"2024-W07","weekStart":"2024-02-12","revenueBase":24515009.65,"revenueFinal":21424737.86,"revenueBaseline":27599472.51,"revenueAnchor":27392410.28,"revenueProgress":0.97,"cogsBase":19381425.65,"cogsFinal":19123888.52,"cogsBaseline":22384568.45,"cogsAnchor":22208266.51,"cogsProgress":0.97},{"weekId":"2024-W08","weekStart":"2024-02-19","revenueBase":31430161.4,"revenueFinal":27123278.75,"revenueBaseline":35015547.7,"revenueAnchor":34634365.02,"revenueProgress":0.97,"cogsBase":24865126.5,"cogsFinal":24204933.81,"cogsBaseline":28767073.01,"cogsAnchor":28436194.12,"cogsProgress":0.97},{"weekId":"2024-W09","weekStart":"2024-02-26","revenueBase":32781562.43,"revenueFinal":24291441.01,"revenueBaseline":35986946.46,"revenueAnchor":35654825.04,"revenueProgress":0.97,"cogsBase":25674901.03,"cogsFinal":21685658.72,"cogsBaseline":29064873.01,"cogsAnchor":28784324.66,"cogsProgress":0.97},{"weekId":"2024-W10","weekStart":"2024-03-04","revenueBase":32316986.66,"revenueFinal":22844765.57,"revenueBaseline":32848474.83,"revenueAnchor":37465949.22,"revenueProgress":0.97,"cogsBase":25615439.93,"cogsFinal":20392039.77,"cogsBaseline":26403018.75,"cogsAnchor":30103989.82,"cogsProgress":0.97},{"weekId":"2024-W11","weekStart":"2024-03-11","revenueBase":39787826.83,"revenueFinal":33022913.02,"revenueBaseline":41049615.72,"revenueAnchor":46726333.43,"revenueProgress":0.97,"cogsBase":32051314.73,"cogsFinal":29485209.21,"cogsBaseline":33884586.84,"cogsAnchor":38539401.62,"cogsProgress":0.97},{"weekId":"2024-W12","weekStart":"2024-03-18","revenueBase":41024327.01,"revenueFinal":36628647.11,"revenueBaseline":43001396.21,"revenueAnchor":49028939.08,"revenueProgress":0.97,"cogsBase":35515170.71,"cogsFinal":32838970.26,"cogsBaseline":38208694.81,"cogsAnchor":43475654.61,"cogsProgress":0.97},{"weekId":"2024-W13","weekStart":"2024-03-25","revenueBase":56749360.17,"revenueFinal":51217060.02,"revenueBaseline":62683733.88,"revenueAnchor":71137356.43,"revenueProgress":0.97,"cogsBase":52447210.82,"cogsFinal":45970781.9,"cogsBaseline":57140607.66,"cogsAnchor":64752398.13,"cogsProgress":0.97},{"weekId":"2024-W14","weekStart":"2024-04-01","revenueBase":38904829.68,"revenueFinal":37445299.18,"revenueBaseline":41813936.14,"revenueAnchor":47940959.46,"revenueProgress":0.97,"cogsBase":34580593.54,"cogsFinal":33609580.13,"cogsBaseline":37384777.48,"cogsAnchor":42822403.45,"cogsProgress":0.97},{"weekId":"2024-W15","weekStart":"2024-04-08","revenueBase":42348010.65,"revenueFinal":31959453.94,"revenueBaseline":46062654.92,"revenueAnchor":52750360.88,"revenueProgress":0.97,"cogsBase":36550118.82,"cogsFinal":28671682.63,"cogsBaseline":40100043.56,"cogsAnchor":45928130.49,"cogsProgress":0.97},{"weekId":"2024-W16","weekStart":"2024-04-15","revenueBase":49028767.06,"revenueFinal":37682082.22,"revenueBaseline":55940220.36,"revenueAnchor":63856289.33,"revenueProgress":0.98,"cogsBase":39590533.38,"cogsFinal":33652707.1,"cogsBaseline":45296709.91,"cogsAnchor":51792330.39,"cogsProgress":0.98},{"weekId":"2024-W17","weekStart":"2024-04-22","revenueBase":59386738.37,"revenueFinal":44291081.29,"revenueBaseline":67935719.66,"revenueAnchor":77388365.06,"revenueProgress":0.98,"cogsBase":47183975.3,"cogsFinal":39532821.39,"cogsBaseline":54469488.73,"cogsAnchor":62126101.08,"cogsProgress":0.98},{"weekId":"2024-W18","weekStart":"2024-04-29","revenueBase":54287645.01,"revenueFinal":47255161.26,"revenueBaseline":60285231.83,"revenueAnchor":68828574.9,"revenueProgress":0.98,"cogsBase":43315425.28,"cogsFinal":42153742.64,"cogsBaseline":48059206.98,"cogsAnchor":54908127.27,"cogsProgress":0.98},{"weekId":"2024-W19","weekStart":"2024-05-06","revenueBase":47825140.41,"revenueFinal":30668278.86,"revenueBaseline":52987627.57,"revenueAnchor":60722067.71,"revenueProgress":0.98,"cogsBase":37789000.5,"cogsFinal":27341459.49,"cogsBaseline":42590482.7,"cogsAnchor":48817356.4,"cogsProgress":0.98},{"weekId":"2024-W20","weekStart":"2024-05-13","revenueBase":51397661.62,"revenueFinal":38304987.14,"revenueBaseline":57074538.11,"revenueAnchor":65357269.78,"revenueProgress":0.98,"cogsBase":40271285.64,"cogsFinal":34151935.88,"cogsBaseline":45499336.54,"cogsAnchor":52102514.47,"cogsProgress":0.98},{"weekId":"2024-W21","weekStart":"2024-05-20","revenueBase":56107884.34,"revenueFinal":39138986.54,"revenueBaseline":62646586.51,"revenueAnchor":71652992.82,"revenueProgress":0.98,"cogsBase":44019015.42,"cogsFinal":34898315.52,"cogsBaseline":50382219.2,"cogsAnchor":57611641.21,"cogsProgress":0.98},{"weekId":"2024-W22","weekStart":"2024-05-27","revenueBase":72675125.73,"revenueFinal":61443226.69,"revenueBaseline":81736029.75,"revenueAnchor":93159781.1,"revenueProgress":0.98,"cogsBase":58358799.74,"cogsFinal":54793254.7,"cogsBaseline":65699981.5,"cogsAnchor":74866891.89,"cogsProgress":0.98},{"weekId":"2024-W23","weekStart":"2024-06-03","revenueBase":46240200.09,"revenueFinal":30682014.65,"revenueBaseline":50545406.14,"revenueAnchor":58105268.15,"revenueProgress":0.98,"cogsBase":36316483.55,"cogsFinal":27379482.06,"cogsBaseline":40441315.72,"cogsAnchor":46480256.66,"cogsProgress":0.98},{"weekId":"2024-W24","weekStart":"2024-06-10","revenueBase":51460009.28,"revenueFinal":35372815.0,"revenueBaseline":56742319.14,"revenueAnchor":65090236.92,"revenueProgress":0.98,"cogsBase":40717593.88,"cogsFinal":31566254.13,"cogsBaseline":45661337.98,"cogsAnchor":52363724.89,"cogsProgress":0.98},{"weekId":"2024-W25","weekStart":"2024-06-17","revenueBase":51997669.43,"revenueFinal":36102678.2,"revenueBaseline":57447464.7,"revenueAnchor":65891615.55,"revenueProgress":0.98,"cogsBase":41530192.33,"cogsFinal":32232776.37,"cogsBaseline":47257851.98,"cogsAnchor":54172649.22,"cogsProgress":0.98},{"weekId":"2024-W26","weekStart":"2024-06-24","revenueBase":58721784.23,"revenueFinal":40942283.8,"revenueBaseline":64577994.13,"revenueAnchor":73933235.46,"revenueProgress":0.98,"cogsBase":53620126.44,"cogsFinal":36842808.53,"cogsBaseline":59377379.22,"cogsAnchor":67856990.33,"cogsProgress":0.98},{"weekId":"2024-W27","weekStart":"2024-07-01","revenueBase":33509395.17,"revenueFinal":6100461.57,"revenueBaseline":35377083.0,"revenueAnchor":40880159.26,"revenueProgress":0.98,"cogsBase":30412114.48,"cogsFinal":5504018.57,"cogsBaseline":33111875.09,"cogsAnchor":38164125.93,"cogsProgress":0.98}];
+    const canvas = document.getElementById("chart");
+    const ctx = canvas.getContext("2d");
+    const tooltip = document.getElementById("tooltip");
+    const revenueBtn = document.getElementById("revenueBtn");
+    const cogsBtn = document.getElementById("cogsBtn");
+    let metric = "revenue";
+    let hoverIndex = null;
+
+    function money(value) {
+      if (value === null || value === undefined || Number.isNaN(value)) return "-";
+      return "VND " + Number(value).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
+    function keys() {
+      if (metric === "revenue") {
+        return { base: "revenueBase", final: "revenueFinal", baseline: "revenueBaseline", anchor: "revenueAnchor", progress: "revenueProgress" };
+      }
+      return { base: "cogsBase", final: "cogsFinal", baseline: "cogsBaseline", anchor: "cogsAnchor", progress: "cogsProgress" };
+    }
+    function bounds(k) {
+      const vals = [];
+      DATA.forEach(row => [k.base, k.final, k.baseline, k.anchor].forEach(key => {
+        const v = row[key];
+        if (v !== null && Number.isFinite(v)) vals.push(v);
+      }));
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+      const pad = (max - min) * 0.08 || max * 0.08 || 1;
+      return { min: Math.max(0, min - pad), max: max + pad };
+    }
+    function drawLine(points, color, width, dash = []) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.setLineDash(dash);
+      ctx.beginPath();
+      let open = false;
+      points.forEach(p => {
+        if (p.y === null) {
+          open = false;
+          return;
+        }
+        if (!open) {
+          ctx.moveTo(p.x, p.y);
+          open = true;
+        } else {
+          ctx.lineTo(p.x, p.y);
+        }
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      draw();
+    }
+    function draw() {
+      const isRevenue = metric === "revenue";
+      revenueBtn.classList.toggle("active", isRevenue);
+      cogsBtn.classList.toggle("active", !isRevenue);
+      const rect = canvas.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+      const pad = { left: 74, right: 24, top: 20, bottom: 42 };
+      const plotW = w - pad.left - pad.right;
+      const plotH = h - pad.top - pad.bottom;
+      const k = keys();
+      const b = bounds(k);
+      const x = i => pad.left + (DATA.length <= 1 ? 0 : i * plotW / (DATA.length - 1));
+      const y = v => pad.top + (b.max - v) * plotH / (b.max - b.min);
+
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = "#e5e7eb";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#667085";
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i <= 5; i++) {
+        const val = b.min + (b.max - b.min) * i / 5;
+        const yy = y(val);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, yy);
+        ctx.lineTo(w - pad.right, yy);
+        ctx.stroke();
+        ctx.fillText(money(val), pad.left - 8, yy);
+      }
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      [0, Math.floor(DATA.length * 0.25), Math.floor(DATA.length * 0.5), Math.floor(DATA.length * 0.75), DATA.length - 1].forEach(i => {
+        ctx.fillText(DATA[i].weekStart, x(i), h - pad.bottom + 16);
+      });
+
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.baseline] === null ? null : y(row[k.baseline]) })), "#dc2626", 2, [6, 4]);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.anchor] === null ? null : y(row[k.anchor]) })), "#059669", 2.5);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.final] === null ? null : y(row[k.final]) })), "#7c3aed", 2);
+      drawLine(DATA.map((row, i) => ({ x: x(i), y: row[k.base] === null ? null : y(row[k.base]) })), "#2563eb", 2.5);
+
+      if (hoverIndex !== null) {
+        const row = DATA[hoverIndex];
+        const xx = x(hoverIndex);
+        const anchorY = row[k.base] !== null ? y(row[k.base]) : pad.top;
+        ctx.strokeStyle = "#111827";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xx, pad.top);
+        ctx.lineTo(xx, h - pad.bottom);
+        ctx.stroke();
+        tooltip.style.display = "block";
+        tooltip.style.left = `${Math.min(Math.max(xx, 120), w - 120)}px`;
+        tooltip.style.top = `${Math.max(anchorY, 90)}px`;
+        tooltip.innerHTML = `
+          <strong>${row.weekId}</strong><br>
+          LV1 base: ${money(row[k.base])}<br>
+          Final sum: ${money(row[k.final])}<br>
+          Pre-COVID baseline: ${money(row[k.baseline])}<br>
+          Recovery anchor: ${money(row[k.anchor])}<br>
+          Progress: ${row[k.progress] === null ? "-" : (Number(row[k.progress]) * 100).toFixed(1) + "%"}
+        `;
+      } else {
+        tooltip.style.display = "none";
+      }
+    }
+    canvas.addEventListener("mousemove", event => {
+      const rect = canvas.getBoundingClientRect();
+      const xPos = event.clientX - rect.left;
+      const plotW = rect.width - 74 - 24;
+      const idx = Math.round((xPos - 74) * (DATA.length - 1) / plotW);
+      hoverIndex = Math.min(Math.max(idx, 0), DATA.length - 1);
+      draw();
+    });
+    canvas.addEventListener("mouseleave", () => {
+      hoverIndex = null;
+      draw();
+    });
+    revenueBtn.addEventListener("click", () => { metric = "revenue"; draw(); });
+    cogsBtn.addEventListener("click", () => { metric = "cogs"; draw(); });
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+  </script>
+</body>
+</html>

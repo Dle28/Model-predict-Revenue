@@ -1,0 +1,11 @@
+metric,value
+days,3833.0
+top_1pct_days,39.0
+top_5pct_days,192.0
+top_1pct_rev_share,0.03734491781269332
+top_5pct_rev_share,0.13986663187018383
+top_10_days_share,0.01105896737347371
+p50_daily_rev,3647303.9
+p90_daily_rev,7685788.530000002
+p99_daily_rev,13801990.053599996
+max_daily_rev,20905271.35

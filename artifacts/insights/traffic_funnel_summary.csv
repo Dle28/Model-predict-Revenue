@@ -1,0 +1,9 @@
+metric,value
+corr_revenue_sessions,0.28332729747671015
+corr_revenue_orders,0.9359414011852021
+corr_revenue_rev_per_session,0.7525333853484683
+median_rev_per_session,164.16678970958054
+p10_rev_per_session,72.38644309853045
+p90_rev_per_session,320.7410372374118
+median_orders_per_1000_sessions,6.315190749659397
+median_cancel_rate,0.09090909090909091
