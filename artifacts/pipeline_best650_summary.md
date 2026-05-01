@@ -4,7 +4,7 @@
 - Canonical variant: `outputs\submission_best650_rev1000_cogs1015.csv`
 - Raw model output: `outputs\submission_model_raw.csv`
 - Intervals: `outputs\submission_intervals.csv`
-- SHAP: skipped
+- SHAP directory: `artifacts\shap`
 
 ## Totals
 
